@@ -636,7 +636,12 @@ class TestReplicaQueueLengthPolicy:
         new_num_replicas, _ = wrapped_replica_queue_length_autoscaling_policy(ctx=ctx)
         assert new_num_replicas == 100
 
-        # Two new replicas spun up during this timestep.
+        # Two new replicas spun up during this timestep. The metric (123 requests
+        # across 3 running replicas) would drive desired well above the committed
+        # target, but anti-windup holds it at the committed target (100) while the
+        # already-requested replicas are still starting -- the transient backlog
+        # drains once they come up, and normal scale-up resumes after current
+        # catches up to the target and the backlog is re-measured.
         ctx = create_context_with_overrides(
             ctx,
             total_num_requests=123,
@@ -644,7 +649,7 @@ class TestReplicaQueueLengthPolicy:
             target_num_replicas=100,
         )
         new_num_replicas, _ = wrapped_replica_queue_length_autoscaling_policy(ctx=ctx)
-        assert new_num_replicas == 123
+        assert new_num_replicas == 100
 
         # A lot of queries got drained and a lot of replicas started up, but
         # new_num_replicas should not decrease, because of the downscale delay.
@@ -652,10 +657,10 @@ class TestReplicaQueueLengthPolicy:
             ctx,
             total_num_requests=10,
             current_num_replicas=4,
-            target_num_replicas=123,
+            target_num_replicas=100,
         )
         new_num_replicas, _ = wrapped_replica_queue_length_autoscaling_policy(ctx=ctx)
-        assert new_num_replicas == 123
+        assert new_num_replicas == 100
 
     @pytest.mark.parametrize("delay_s", [30.0, 0.0])
     def test_fluctuating_ongoing_requests(self, delay_s):

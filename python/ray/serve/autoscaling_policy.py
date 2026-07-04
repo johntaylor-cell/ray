@@ -153,6 +153,16 @@ def _apply_default_params(
         desired_num_replicas, ctx.current_num_replicas, ctx.config
     )
 
+    # Anti-windup: while replicas we already committed to are still starting
+    # (0 < current < target), the queue-length metric is inflated by the transient
+    # backlog those in-flight replicas will drain, so the (scaling-factor-amplified)
+    # desired overshoots the committed target. Cap it at the committed target until
+    # current catches up and the backlog is re-measured; then normal scale-up
+    # resumes. Applied after the scaling factor so a non-default upscaling_factor
+    # can't re-inflate past the target. Scale-down is unaffected.
+    if 0 < ctx.current_num_replicas < ctx.target_num_replicas:
+        desired_num_replicas = min(desired_num_replicas, ctx.target_num_replicas)
+
     # If curr num replicas is 0 and the policy wants to scale up (e.g. based on internal
     # signals like queue length), bypass the delay logic for immediate scale-up.
     if ctx.current_num_replicas == 0 and desired_num_replicas > 0:
@@ -333,6 +343,7 @@ def _core_replica_queue_length_policy(
     target_num_requests = config.get_target_ongoing_requests() * num_running_replicas
     error_ratio = ctx.total_num_requests / target_num_requests
     desired_num_replicas = num_running_replicas * error_ratio
+
     return desired_num_replicas, {}
 
 
