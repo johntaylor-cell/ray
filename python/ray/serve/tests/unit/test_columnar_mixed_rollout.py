@@ -207,5 +207,84 @@ def test_handle_cross_format_staleness_guard():
     assert st._handle_report_ts[hid] == NOW + 20
 
 
+def _handle_report_running(hid, replica_str, running, queued):
+    """HandleMetricReport carrying per-replica RUNNING timeseries + queued (the
+    handle-collection default). The sibling _handle_report only covers queued."""
+    return HandleMetricReport(
+        deployment_id=DEP,
+        handle_id=hid,
+        actor_id="a",
+        handle_source=DeploymentHandleSource.PROXY,
+        aggregated_queued_requests=0.0,
+        queued_requests=queued,
+        aggregated_metrics={RUNNING_REQUESTS_KEY: {replica_str: 0.0}},
+        metrics={RUNNING_REQUESTS_KEY: {replica_str: running}},
+        timestamp=NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "agg", [AggregationFunction.MEAN, AggregationFunction.MAX, AggregationFunction.MIN]
+)
+def test_stale_replica_arrays_do_not_suppress_handle_running(agg, monkeypatch):
+    """Regression (@cursor): _columnar_aggregate_total_requests must gate the replica
+    branch on whether a RUNNING replica reported, NOT on _replica_running_arrays being
+    non-empty. A dict holding only a stale stopped-replica entry (populated until
+    on_replica_stopped clears it) must fall through to the handle-running path exactly
+    as the object path does -- otherwise handle-collected running metrics are dropped
+    and the total collapses to queued-only.
+
+    Fleet: one RUNNING replica whose running is reported ON A HANDLE (handle collection)
+    plus one STOPPED replica whose columnar running array still lingers. The columnar
+    total must equal its all-cloudpickle twin for every aggregation function.
+    """
+    monkeypatch.setattr(A.time, "time", lambda: NOW + 3.0)
+    live = ReplicaID("r_live", DEP)
+    stale = ReplicaID("r_stale", DEP)
+    live_str = live.to_full_id_str()
+    running = [TimeStampedValue(NOW - 6, 4.0), TimeStampedValue(NOW, 6.0)]
+    queued = [TimeStampedValue(NOW - 6, 2.0), TimeStampedValue(NOW, 3.0)]
+    handle = _handle_report_running("h0", live_str, running, queued)
+    # Stale stopped replica: large values that MUST be ignored (it is not running).
+    stale_rep = ReplicaMetricReport(
+        replica_id=stale,
+        aggregated_metrics={RUNNING_REQUESTS_KEY: 0.0},
+        metrics={
+            RUNNING_REQUESTS_KEY: [
+                TimeStampedValue(NOW - 6, 99.0),
+                TimeStampedValue(NOW, 99.0),
+            ]
+        },
+        timestamp=NOW,
+    )
+
+    # Object twin (reference): handle + stale replica in the cloudpickle stores.
+    ref = _state(agg)
+    ref._handle_requests["h0"] = handle
+    ref._replica_metrics[stale] = stale_rep
+    ref._running_replicas = {live}
+    ref._cached_running_replica_strs = {live_str}
+    ref_total = ref._calculate_total_requests_aggregate_mode()
+
+    # Columnar fleet: handle running via columnar arrays; the stale replica's columnar
+    # array lingers in _replica_running_arrays (never cleared -> dict stays non-empty).
+    mix = _state(agg)
+    mix.record_columnar_metrics_for_handle(
+        codec.decode_handle_flat(codec.encode(handle))
+    )
+    rid, ts, val, t = codec.decode_replica_running_requests(codec.encode(stale_rep))
+    mix._replica_running_arrays[rid] = (ts, val, t)
+    mix._running_replicas = {live}
+    mix._cached_running_replica_strs = {live_str}
+    assert mix._replica_running_arrays  # non-empty dict == the buggy gate's trigger
+    assert rid not in mix._running_replicas  # ...but its only entry is not running
+    mix_total = mix._calculate_total_requests_aggregate_mode()
+
+    # Pre-fix this collapsed to queued-only (handle running dropped); post-fix it
+    # matches the object twin exactly for MEAN/MAX/MIN.
+    assert mix_total > 0.0
+    assert abs(ref_total - mix_total) < 1e-9
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", __file__]))

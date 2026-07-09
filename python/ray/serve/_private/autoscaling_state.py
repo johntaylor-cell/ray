@@ -326,18 +326,24 @@ class DeploymentAutoscalingState:
         """Aggregate-mode total. Direct-ingress (replica) sources use the array-concat
         numpy merge; pure handle-collection uses the FUSED Cython decode->merge kernel
         over flat per-handle arrays (no per-replica Python objects). Exact-equivalent."""
-        if self._replica_running_arrays:
-            segments = []
-            for replica_id in self._running_replicas:
-                a = self._replica_running_arrays.get(replica_id)
-                if a is not None and a[0].size:
-                    segments.append((a[0], a[1]))
+        # Replica (direct-ingress) running segments: RUNNING replicas only,
+        # mirroring _collect_replica_running_requests. Gate on whether a running
+        # replica actually reported -- NOT on _replica_running_arrays being
+        # non-empty. A dict holding only stale stopped-replica entries (before
+        # on_replica_stopped clears them) must fall through to the handle-running
+        # path exactly as the object path does, else handle-collected running
+        # metrics are dropped and the total reads as queued-only.
+        replica_segments = []
+        for replica_id in self._running_replicas:
+            a = self._replica_running_arrays.get(replica_id)
+            if a is not None and a[0].size:
+                replica_segments.append((a[0], a[1]))
+        if replica_segments:
+            segments = replica_segments
             for hm in self._handle_arrays.values():
                 qts, qval = hm["q_ts"], hm["q_val"]
                 if qts.size:
                     segments.append((qts, qval))
-            if not segments:
-                return 0.0
             offs, ts_parts, val_parts = [0], [], []
             for tarr, varr in segments:
                 ts_parts.append(tarr)
