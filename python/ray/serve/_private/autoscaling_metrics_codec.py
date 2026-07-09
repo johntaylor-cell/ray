@@ -37,7 +37,6 @@ from ray.serve._private.common import (
     TimeStampedValue,
 )
 from ray.serve._private.constants import (
-    RAY_SERVE_COLUMNAR_METRICS,
     RAY_SERVE_COLUMNAR_METRICS_MIN_REPLICAS,
 )
 
@@ -48,8 +47,8 @@ def is_columnar(buf: bytes) -> bool:
     """Wire-detect: True iff ``buf`` is a columnar (SCR1) frame.
 
     The 4-byte magic is framed OUTSIDE the zlib stream, so any ingestion path can
-    route on the wire format alone -- independently of the RAY_SERVE_COLUMNAR_METRICS
-    producer flag. A fleet mid-rollout (mixed columnar/cloudpickle senders) is then
+    route on the wire format alone -- independently of how the producer chose to
+    encode. A fleet mid-rollout (mixed columnar/cloudpickle senders) is then
     handled correctly: the consumer reads whatever each sender actually emitted."""
     return len(buf) >= 4 and buf[:4] == _MAGIC
 
@@ -111,8 +110,8 @@ def should_encode_columnar(
 
     Format is chosen by report TYPE and self-identifies on the wire (see is_columnar),
     so mixed columnar/object sources aggregate correctly at the controller:
-      - HandleMetricReport (fat: many replicas x points) -> columnar when the opt is
-        enabled AND the report covers >= RAY_SERVE_COLUMNAR_METRICS_MIN_REPLICAS replicas
+      - HandleMetricReport (fat: many replicas x points) -> columnar when the report
+        covers >= RAY_SERVE_COLUMNAR_METRICS_MIN_REPLICAS replicas
         (decode + GIL-release win only above the measured ~64-replicas/handle crossover;
         below it the array machinery is pure overhead, so thin reports stay objects).
       - ReplicaMetricReport (one replica, small) -> ALWAYS Python objects: columnar's
@@ -126,7 +125,7 @@ def should_encode_columnar(
     Returns:
         True to encode columnar, False to use the Python-object path.
     """
-    if not (RAY_SERVE_COLUMNAR_METRICS and isinstance(report, HandleMetricReport)):
+    if not isinstance(report, HandleMetricReport):
         return False
     # Width gate: columnar only beats the object path on FAT reports (~64 replicas/handle
     # crossover, measured). Use the widest metric's replica set as the report width; thin

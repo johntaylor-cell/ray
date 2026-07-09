@@ -797,8 +797,8 @@ class DeploymentAutoscalingState:
         has_columnar = bool(self._replica_running_arrays or self._handle_arrays)
         has_object = bool(self._replica_metrics or self._handle_requests)
         # Homogeneous fleets keep their native fast path. Columnar arrays are used
-        # whenever present, independent of RAY_SERVE_COLUMNAR_METRICS -- the controller
-        # wire-detects the format, so a flag-off controller still counts columnar.
+        # whenever present -- the controller wire-detects the format from the frame
+        # magic, so it counts columnar reports regardless of how they were produced.
         if has_columnar and not has_object:
             return self._columnar_aggregate_total_requests()
         if has_object and not has_columnar:

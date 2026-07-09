@@ -1,9 +1,9 @@
 """Wire-format contract for the columnar codec.
 
 The SCR1 magic is framed OUTSIDE zlib, so any ingestion path can detect the format
-in O(1) from the bytes alone -- independently of the RAY_SERVE_COLUMNAR_METRICS
-producer flag. This makes a fleet mid-rollout (mixed columnar/cloudpickle senders)
-safe: the controller routes on what each sender actually emitted.
+in O(1) from the bytes alone -- independently of how the producer chose to encode.
+This makes a fleet mid-rollout (mixed columnar/cloudpickle senders) safe: the
+controller routes on what each sender actually emitted.
 """
 import pytest
 
@@ -105,17 +105,11 @@ def _handle_report_width(n):
 def test_should_encode_columnar_width_gate(monkeypatch):
     """Producers choose columnar only for HANDLE reports wide enough to clear the
     RAY_SERVE_COLUMNAR_METRICS_MIN_REPLICAS gate. Thin handle reports and replica
-    reports stay on the Python-object path; flag off is never columnar. (Columnar's
-    array decode/merge only beats objects above the measured ~64-replica crossover.)"""
+    reports stay on the Python-object path. (Columnar's array decode/merge only
+    beats objects above the measured ~64-replica crossover.)"""
     monkeypatch.setattr(codec, "RAY_SERVE_COLUMNAR_METRICS_MIN_REPLICAS", 64)
 
-    # Flag off: never columnar, regardless of width.
-    monkeypatch.setattr(codec, "RAY_SERVE_COLUMNAR_METRICS", False)
-    assert codec.should_encode_columnar(_handle_report_width(128)) is False
-    assert codec.should_encode_columnar(_replica_report()) is False
-
-    # Flag on: gated on report width (distinct replica keys).
-    monkeypatch.setattr(codec, "RAY_SERVE_COLUMNAR_METRICS", True)
+    # Gated on report width (distinct replica keys).
     assert codec.should_encode_columnar(_handle_report_width(63)) is False  # below gate
     assert codec.should_encode_columnar(_handle_report_width(64)) is True  # at gate
     assert codec.should_encode_columnar(_handle_report_width(128)) is True  # above gate
@@ -125,7 +119,6 @@ def test_should_encode_columnar_width_gate(monkeypatch):
 
 def test_should_encode_columnar_gate_threshold_tunable(monkeypatch):
     """The gate threshold is env-tunable; lowering it lets thinner reports go columnar."""
-    monkeypatch.setattr(codec, "RAY_SERVE_COLUMNAR_METRICS", True)
     monkeypatch.setattr(codec, "RAY_SERVE_COLUMNAR_METRICS_MIN_REPLICAS", 8)
     assert codec.should_encode_columnar(_handle_report_width(7)) is False
     assert codec.should_encode_columnar(_handle_report_width(8)) is True

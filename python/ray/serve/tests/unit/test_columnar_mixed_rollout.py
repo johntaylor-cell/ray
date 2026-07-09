@@ -1,9 +1,9 @@
 """Reviewer-flagged correctness (mixed columnar + cloudpickle stores).
 
 During a rolling upgrade the columnar (array) and cloudpickle (object) metric stores
-can BOTH hold data: the controller wire-detects the format independent of
-RAY_SERVE_COLUMNAR_METRICS. The aggregation must count both, never double-count, and
-be exact for every aggregation function.
+can BOTH hold data: the controller wire-detects the format from the frame magic. The
+aggregation must count both, never double-count, and be exact for every aggregation
+function.
 """
 import random
 import sys
@@ -86,9 +86,10 @@ def test_mixed_rollout_equals_all_object(agg, monkeypatch):
         assert abs(ref_total - mix._calculate_total_requests_aggregate_mode()) < 1e-9
 
 
-def test_columnar_counted_independent_of_flag(monkeypatch):
-    """E: columnar arrays are aggregated whenever present -- the path does not gate on
-    RAY_SERVE_COLUMNAR_METRICS, so a flag-off controller still counts columnar frames."""
+def test_columnar_counted_by_wire_detection(monkeypatch):
+    """E: columnar arrays are aggregated whenever present -- the aggregation path does
+    not depend on how the report was produced, so the controller counts columnar frames
+    purely by wire-detecting them."""
     monkeypatch.setattr(A.time, "time", lambda: NOW + 3.0)
     rng = random.Random(3)
     reports = [_replica_report(i, rng) for i in range(4)]

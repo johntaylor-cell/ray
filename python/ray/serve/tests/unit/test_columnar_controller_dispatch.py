@@ -5,8 +5,8 @@ mode -- never on the producer flag:
   columnar bytes + simple mode    -> reconstruct -> object store (simple/custom safe)
   cloudpickle bytes               -> decompress  -> object store
 
-Guards the "cover all call-flows" contract: enabling RAY_SERVE_COLUMNAR_METRICS must
-never silently zero out autoscaling in the default (simple) mode.
+Guards the "cover all call-flows" contract: emitting columnar reports must never
+silently zero out autoscaling in the default (simple) mode.
 """
 from unittest.mock import MagicMock
 

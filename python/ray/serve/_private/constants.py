@@ -547,10 +547,6 @@ RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE = get_env_bool(
     "RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE", "1"
 )
 
-# Feature flag: serialize autoscaling metric reports columnarly (flat float64
-# arrays) + ingest natively (numpy) instead of cloudpickle. Off = today.
-RAY_SERVE_COLUMNAR_METRICS = get_env_bool("RAY_SERVE_COLUMNAR_METRICS", "0")
-
 # Columnar encoding only pays off once a handle report is wide enough that the
 # native array decode/merge amortizes its fixed per-report overhead. Below this
 # many replica keys in a report the producer keeps the cloudpickle path, so
