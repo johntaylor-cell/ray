@@ -176,7 +176,37 @@ def test_columnar_replica_report_ordering_and_running_clear():
 
     # (2) An out-of-order (older) report is rejected -- nothing overwritten.
     ingest({"gpu_util": [TimeStampedValue(NOW, 0.1)]}, NOW - 100)
-    assert st._replica_columnar_ts[rid] == NOW + 6
+    assert st._replica_report_ts[rid] == NOW + 6
+
+    # (3) Cross-format: a STALE cloudpickle (object) report must not wipe fresher
+    # columnar data. The unified _replica_report_ts gate rejects it even though the
+    # object store is empty (the earlier columnar report cleared it).
+    st.record_request_metrics_for_replica(
+        ReplicaMetricReport(
+            replica_id=rid,
+            aggregated_metrics={RUNNING_REQUESTS_KEY: 0.0},
+            metrics={RUNNING_REQUESTS_KEY: [TimeStampedValue(NOW, 9.0)]},
+            timestamp=NOW + 1,
+        )
+    )
+    assert rid not in st._replica_metrics  # stale object rejected
+    assert "gpu_util" in st._replica_custom_arrays[rid]  # columnar preserved
+    assert st._replica_report_ts[rid] == NOW + 6
+
+    # (4) A fresh object report (newer than the columnar) is accepted and clears the
+    # columnar store, updating the unified gate.
+    st.record_request_metrics_for_replica(
+        ReplicaMetricReport(
+            replica_id=rid,
+            aggregated_metrics={RUNNING_REQUESTS_KEY: 0.0},
+            metrics={RUNNING_REQUESTS_KEY: [TimeStampedValue(NOW, 9.0)]},
+            timestamp=NOW + 20,
+        )
+    )
+    assert rid in st._replica_metrics
+    assert rid not in st._replica_running_arrays
+    assert rid not in st._replica_custom_arrays
+    assert st._replica_report_ts[rid] == NOW + 20
 
 
 if __name__ == "__main__":

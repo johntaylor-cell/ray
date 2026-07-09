@@ -165,5 +165,47 @@ def test_queued_from_both_stores(monkeypatch):
     assert abs(ref_q - mix._get_queued_requests()) < 1e-9
 
 
+def test_handle_cross_format_staleness_guard():
+    """A delayed report in one wire format must not overwrite fresher data the other
+    wrote. A handle flips object<->columnar as it crosses the columnar width gate, so
+    _handle_report_ts is a unified per-handle last-accepted timestamp gating BOTH ingest
+    paths. Regression for the mixed-rollout stale-overwrite bug."""
+    st = _state()
+    hid = "h0"
+
+    def _rep(ts):
+        return HandleMetricReport(
+            deployment_id=DEP,
+            handle_id=hid,
+            actor_id="a",
+            handle_source=DeploymentHandleSource.PROXY,
+            aggregated_queued_requests=0.0,
+            queued_requests=[TimeStampedValue(NOW, 1.0)],
+            aggregated_metrics={RUNNING_REQUESTS_KEY: {}},
+            metrics={RUNNING_REQUESTS_KEY: {}},
+            timestamp=ts,
+        )
+
+    # Fresh columnar report @ NOW+10 -> lands in the array store.
+    st.record_columnar_metrics_for_handle(
+        codec.decode_handle_flat(codec.encode(_rep(NOW + 10)))
+    )
+    assert hid in st._handle_arrays
+    assert st._handle_report_ts[hid] == NOW + 10
+
+    # STALE object report @ NOW+1 must be rejected: object store stays empty, columnar
+    # data preserved, gate unchanged.
+    st.record_request_metrics_for_handle(_rep(NOW + 1))
+    assert hid not in st._handle_requests
+    assert hid in st._handle_arrays
+    assert st._handle_report_ts[hid] == NOW + 10
+
+    # Fresh object report @ NOW+20 is accepted -> clears columnar, updates the gate.
+    st.record_request_metrics_for_handle(_rep(NOW + 20))
+    assert hid in st._handle_requests
+    assert hid not in st._handle_arrays
+    assert st._handle_report_ts[hid] == NOW + 20
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", __file__]))

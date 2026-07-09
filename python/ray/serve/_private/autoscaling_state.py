@@ -89,12 +89,17 @@ class DeploymentAutoscalingState:
         # Non-running columnar metrics per replica (custom autoscaling metrics):
         # replica_id -> {metric_name: (ts_arr, val_arr)}.
         self._replica_custom_arrays: Dict[ReplicaID, Dict[str, tuple]] = dict()
-        # Report-level timestamp of the latest columnar replica report; guards BOTH the
-        # running and custom columnar stores against out-of-order reports (mirrors the
-        # object path's per-report timestamp check).
-        self._replica_columnar_ts: Dict[ReplicaID, float] = dict()
+        # Unified per-replica "last accepted report timestamp" across BOTH wire formats.
+        # Gates the object AND columnar ingest paths so a delayed report in either format
+        # can't overwrite fresher data the other wrote. Cleared only on replica stop --
+        # NOT on a cross-format dedup write.
+        self._replica_report_ts: Dict[ReplicaID, float] = dict()
         # Columnar (flag-gated) per-handle arrays: metadata + per-replica running + queued.
         self._handle_arrays: Dict[str, dict] = dict()
+        # Unified per-handle "last accepted report timestamp" (both wire formats) -- same
+        # cross-format staleness guard as _replica_report_ts; pruned in
+        # drop_stale_handle_metrics.
+        self._handle_report_ts: Dict[str, float] = dict()
         # Async inference task queue length (from QueueMonitor).
         # QueueMonitor is a singleton per deployment i.e. we run a single QueueMonitor actor per task consumer (deployment).
         self._total_pending_async_requests: int = 0
@@ -207,7 +212,7 @@ class DeploymentAutoscalingState:
             del self._replica_metrics[replica_id]
         self._replica_running_arrays.pop(replica_id, None)
         self._replica_custom_arrays.pop(replica_id, None)
-        self._replica_columnar_ts.pop(replica_id, None)
+        self._replica_report_ts.pop(replica_id, None)
 
     def get_num_replicas_lower_bound(self) -> int:
         if self._config.initial_replicas is not None and (
@@ -275,16 +280,17 @@ class DeploymentAutoscalingState:
         replica_id = replica_metric_report.replica_id
         send_timestamp = replica_metric_report.timestamp
 
-        if (
-            replica_id not in self._replica_metrics
-            or send_timestamp > self._replica_metrics[replica_id].timestamp
-        ):
+        # Unified staleness gate across BOTH wire formats (see _replica_report_ts):
+        # reject a report older than the last one accepted in EITHER format, so a delayed
+        # cloudpickle report can't wipe fresher columnar data (or vice versa).
+        last_ts = self._replica_report_ts.get(replica_id)
+        if last_ts is None or send_timestamp > last_ts:
             self._replica_metrics[replica_id] = replica_metric_report
+            self._replica_report_ts[replica_id] = send_timestamp
             # dedup-at-write: this source now reports via cloudpickle; drop any
             # columnar entries so the stores never double-count it.
             self._replica_running_arrays.pop(replica_id, None)
             self._replica_custom_arrays.pop(replica_id, None)
-            self._replica_columnar_ts.pop(replica_id, None)
 
     def record_columnar_metrics_for_replica(
         self, replica_id, metric_arrays, timestamp
@@ -292,10 +298,10 @@ class DeploymentAutoscalingState:
         """Store columnar per-metric arrays for a replica (no per-point objects).
         running_requests feeds the hot-path store; any other metrics feed the custom
         store used by custom autoscaling policies (the columnar decode is lossless)."""
-        prev_ts = self._replica_columnar_ts.get(replica_id)
+        prev_ts = self._replica_report_ts.get(replica_id)
         if prev_ts is not None and timestamp <= prev_ts:
             return
-        self._replica_columnar_ts[replica_id] = timestamp
+        self._replica_report_ts[replica_id] = timestamp
         running = metric_arrays.get(RUNNING_REQUESTS_KEY)
         if running is not None:
             self._replica_running_arrays[replica_id] = (
@@ -404,18 +410,22 @@ class DeploymentAutoscalingState:
         """
         handle_id = handle_metric_report.handle_id
         send_timestamp = handle_metric_report.timestamp
-        if (
-            handle_id not in self._handle_requests
-            or send_timestamp > self._handle_requests[handle_id].timestamp
-        ):
+        # Unified staleness gate across BOTH wire formats (see _handle_report_ts): a
+        # handle flips object<->columnar when it crosses the columnar width gate, so
+        # guard against a delayed report in either format wiping the other's data.
+        last_ts = self._handle_report_ts.get(handle_id)
+        if last_ts is None or send_timestamp > last_ts:
             self._handle_requests[handle_id] = handle_metric_report
+            self._handle_report_ts[handle_id] = send_timestamp
             self._handle_arrays.pop(handle_id, None)
 
     def record_columnar_metrics_for_handle(self, d) -> None:
         """Store columnar handle metrics (no per-point objects)."""
         hid = d["handle_id"]
-        existing = self._handle_arrays.get(hid)
-        if existing is None or d["timestamp"] > existing["timestamp"]:
+        # Unified staleness gate across BOTH wire formats (see _handle_report_ts).
+        last_ts = self._handle_report_ts.get(hid)
+        if last_ts is None or d["timestamp"] > last_ts:
+            self._handle_report_ts[hid] = d["timestamp"]
             self._handle_arrays[hid] = {
                 "actor_id": d["actor_id"],
                 "is_component": d["handle_source"] in ("PROXY", "REPLICA"),
@@ -485,6 +495,13 @@ class DeploymentAutoscalingState:
                         f"because no update was received for {timeout_s:.1f}s. "
                         f"Ongoing requests was: {handle_metric.total_requests}."
                     )
+
+        # Prune the unified per-handle timestamp gate to handles still tracked in either
+        # store (any dropped above no longer appear in _handle_arrays/_handle_requests).
+        live_handles = set(self._handle_arrays) | set(self._handle_requests)
+        for hid in list(self._handle_report_ts):
+            if hid not in live_handles:
+                del self._handle_report_ts[hid]
 
     def record_autoscaling_metrics(
         self,
