@@ -30,7 +30,7 @@ class ClusterNodeInfoCache(ABC):
         self._apply_snapshot(self._compute_snapshot())
 
     async def refresh_async(self):
-        """RAY_SERVE_ASYNC_NODE_INFO: non-blocking refresh. The GCS calls release the
+        """Non-blocking node-info refresh. The GCS calls release the
         GIL (with nogil), so running _compute_snapshot in an executor lets the
         control loop keep running while a slow GCS reply is in flight; the snapshot is
         applied on the event-loop thread (race-free). One refresh in flight at a time."""
