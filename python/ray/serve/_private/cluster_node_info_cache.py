@@ -24,10 +24,18 @@ class ClusterNodeInfoCache(ABC):
         # rebuilding labels / total resources when nothing changed.
         self._alive_node_id_set: FrozenSet[str] = frozenset()
         self._refresh_in_flight: bool = False
+        # Monotonic epoch stamped when a refresh/update is ISSUED. A late
+        # async apply whose issuing op started before an already-applied op
+        # is dropped, so an in-flight refresh_async cannot clobber a newer
+        # snapshot (e.g. the synchronous shutdown update() applied while the
+        # async refresh was still suspended in the executor).
+        self._refresh_epoch: int = 0
+        self._applied_epoch: int = 0
 
     def update(self):
         """Update the cache by fetching latest node information from GCS (blocking)."""
-        self._apply_snapshot(self._compute_snapshot())
+        epoch = self._next_epoch()
+        self._apply_snapshot(self._compute_snapshot(), epoch)
 
     async def refresh_async(self):
         """Non-blocking node-info refresh. The GCS calls release the
@@ -38,9 +46,13 @@ class ClusterNodeInfoCache(ABC):
             return
         self._refresh_in_flight = True
         try:
+            # Stamp the epoch at ISSUE time (before the executor await) so a
+            # refresh/update started later -- e.g. the shutdown update() -- wins
+            # over this one regardless of which GCS reply returns first.
+            epoch = self._next_epoch()
             loop = asyncio.get_running_loop()
             snapshot = await loop.run_in_executor(None, self._compute_snapshot)
-            self._apply_snapshot(snapshot)
+            self._apply_snapshot(snapshot, epoch)
         except Exception:
             logger.warning(
                 "Async node-info refresh failed; node info cache will be stale.",
@@ -49,7 +61,18 @@ class ClusterNodeInfoCache(ABC):
         finally:
             self._refresh_in_flight = False
 
-    def _apply_snapshot(self, snapshot):
+    def _next_epoch(self) -> int:
+        self._refresh_epoch += 1
+        return self._refresh_epoch
+
+    def _apply_snapshot(self, snapshot, epoch):
+        # Drop a stale apply whose issuing refresh/update started before one that
+        # already landed (epochs are unique + monotonic, so `<` suffices). This is
+        # what stops an in-flight async refresh from overwriting the newer snapshot
+        # written by the synchronous shutdown update().
+        if epoch < self._applied_epoch:
+            return
+        self._applied_epoch = epoch
         # No await between assignments -> atomic on the event loop; readers never see a
         # partially-updated cache.
         (
