@@ -599,6 +599,13 @@ class ServeController:
         self, start_time: float, recovering_timeout: float, num_loops: int
     ):
         if self._shutting_down:
+            # The background node-info refresh loop exits once _shutting_down is set, so
+            # refresh synchronously here to keep the cache current for proxy cleanup and
+            # scheduling during shutdown (restores the pre-async per-step refresh).
+            try:
+                self.cluster_node_info_cache.update()
+            except Exception:
+                logger.exception("Exception updating cluster node info cache.")
             try:
                 self.shutdown()
             except Exception:
