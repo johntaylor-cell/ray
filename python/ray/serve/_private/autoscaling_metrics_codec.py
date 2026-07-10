@@ -270,7 +270,14 @@ def reconstruct(buf: bytes) -> Union[HandleMetricReport, ReplicaMetricReport]:
                 TimeStampedValue(float(ts[off + j]), float(val[off + j]))
                 for j in range(n)
             ]
-            aggregated[m][key] = float(agg[i])
+            v = float(agg[i])
+            # _encode pads a metrics entry that has no matching aggregated
+            # value with NaN so every entry gets an agg slot; skip it here so
+            # reconstruct stays a faithful inverse and never injects a key the
+            # original aggregated_metrics lacked (a stray NaN on the running-
+            # requests key would poison the simple-mode request sum).
+            if v == v:  # NaN is the only value not equal to itself
+                aggregated[m][key] = v
         return HandleMetricReport(
             deployment_id=DeploymentID(h["deployment"][0], h["deployment"][1]),
             handle_id=h["handle_id"],
@@ -295,7 +302,9 @@ def reconstruct(buf: bytes) -> Union[HandleMetricReport, ReplicaMetricReport]:
                 TimeStampedValue(float(ts[off + j]), float(val[off + j]))
                 for j in range(n)
             ]
-            aggregated[m] = float(agg[i])
+            v = float(agg[i])
+            if v == v:  # skip NaN padding (see handle branch): faithful inverse
+                aggregated[m] = v
         return ReplicaMetricReport(
             replica_id=ReplicaID(
                 h["replica_unique_id"],
