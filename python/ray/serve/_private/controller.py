@@ -371,6 +371,30 @@ class ServeController:
     def get_pid(self) -> int:
         return os.getpid()
 
+    def _observe_replica_metrics_delay(
+        self, delay_ms: float, deployment: str, application: str
+    ) -> None:
+        """Record replica-report ingest delay to BOTH sinks -- the Prometheus histogram
+        (external) and the internal health tracker -- so every ingest path (columnar fast
+        path and object path) reports delay identically. The histogram omits the
+        per-replica tag to keep Prometheus cardinality bounded."""
+        self.replica_metrics_delay_histogram.observe(
+            delay_ms,
+            tags={"deployment": deployment, "application": application},
+        )
+        self._health_metrics_tracker.record_replica_metrics_delay(delay_ms)
+
+    def _observe_handle_metrics_delay(
+        self, delay_ms: float, deployment: str, application: str
+    ) -> None:
+        """Same as _observe_replica_metrics_delay for handle reports; omits the per-handle
+        tag to keep Prometheus cardinality bounded."""
+        self.handle_metrics_delay_histogram.observe(
+            delay_ms,
+            tags={"deployment": deployment, "application": application},
+        )
+        self._health_metrics_tracker.record_handle_metrics_delay(delay_ms)
+
     def record_autoscaling_metrics_from_replica(
         self, replica_metric_report: Union[ReplicaMetricReport, bytes]
     ):
@@ -392,8 +416,10 @@ class ServeController:
                     self._health_metrics_tracker.record_decompress(
                         (time.time() - _decode_start) * 1000
                     )
-                    self._health_metrics_tracker.record_replica_metrics_delay(
-                        (time.time() - report_ts) * 1000
+                    self._observe_replica_metrics_delay(
+                        (time.time() - report_ts) * 1000,
+                        replica_id.deployment_id.name,
+                        replica_id.deployment_id.app_name,
                     )
                     self.autoscaling_state_manager.record_columnar_metrics_for_replica(
                         replica_id, metric_arrays, report_ts
@@ -422,18 +448,7 @@ class ServeController:
         deployment = replica_metric_report.replica_id.deployment_id.name
         application = replica_metric_report.replica_id.deployment_id.app_name
 
-        # Record the metrics delay for observability. A histogram lets Prometheus
-        # aggregate reports from all replicas of a deployment, so we omit the
-        # per-replica tag to keep cardinality bounded.
-        self.replica_metrics_delay_histogram.observe(
-            latency_ms,
-            tags={
-                "deployment": deployment,
-                "application": application,
-            },
-        )
-        # Track in health metrics
-        self._health_metrics_tracker.record_replica_metrics_delay(latency_ms)
+        self._observe_replica_metrics_delay(latency_ms, deployment, application)
         self.autoscaling_state_manager.record_request_metrics_for_replica(
             replica_metric_report
         )
@@ -458,8 +473,10 @@ class ServeController:
                     self._health_metrics_tracker.record_decompress(
                         (time.time() - _decode_start) * 1000
                     )
-                    self._health_metrics_tracker.record_handle_metrics_delay(
-                        (time.time() - d["timestamp"]) * 1000
+                    self._observe_handle_metrics_delay(
+                        (time.time() - d["timestamp"]) * 1000,
+                        d["deployment_id"].name,
+                        d["deployment_id"].app_name,
                     )
                     self.autoscaling_state_manager.record_columnar_metrics_for_handle(d)
                     self._health_metrics_tracker.record_handle_ingest(
@@ -486,18 +503,7 @@ class ServeController:
         deployment = handle_metric_report.deployment_id.name
         application = handle_metric_report.deployment_id.app_name
 
-        # Record the metrics delay for observability. A histogram lets Prometheus
-        # aggregate reports from all handles of a deployment, so we omit the
-        # per-handle tag to keep cardinality bounded.
-        self.handle_metrics_delay_histogram.observe(
-            latency_ms,
-            tags={
-                "deployment": deployment,
-                "application": application,
-            },
-        )
-        # Track in health metrics
-        self._health_metrics_tracker.record_handle_metrics_delay(latency_ms)
+        self._observe_handle_metrics_delay(latency_ms, deployment, application)
         self.autoscaling_state_manager.record_request_metrics_for_handle(
             handle_metric_report
         )
