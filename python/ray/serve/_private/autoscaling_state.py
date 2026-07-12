@@ -813,7 +813,12 @@ class DeploymentAutoscalingState:
     def _object_aggregate_total_requests(self) -> float:
         """Aggregate-mode total over the cloudpickle/object stores
         (_replica_metrics / _handle_requests). 0 when both are empty."""
-        replica_timeseries = self._collect_replica_running_requests()
+        # Only replicas that carry actual running-request data count as "collected
+        # on replicas"; an empty running series (no samples) must not suppress
+        # handle-side running. Matches the columnar/mixed paths (equivalence).
+        replica_timeseries = [
+            ts for ts in self._collect_replica_running_requests() if ts
+        ]
         metrics_collected_on_replicas = len(replica_timeseries) > 0
         queued_timeseries = self._collect_handle_queued_requests()
         if not metrics_collected_on_replicas:
@@ -887,6 +892,12 @@ class DeploymentAutoscalingState:
         exact aggregation semantics. Disjoint by dedup-at-write (no double-count)."""
         replica_ts = list(self._collect_replica_running_requests())
         replica_ts += self._columnar_replica_running_as_timeseries()
+        # Only replicas that carry actual running-request data count as "collected
+        # on replicas". An empty cloudpickle running series (no samples) must not
+        # flip this flag, or it would suppress handle-side running -- which carries
+        # the real load during a mixed rollout -- and undercount. Mirrors the
+        # columnar collector empty-skip so both sources are treated consistently.
+        replica_ts = [ts for ts in replica_ts if ts]
         metrics_collected_on_replicas = len(replica_ts) > 0
         queued_ts = list(self._collect_handle_queued_requests())
         queued_ts += self._columnar_handle_queued_as_timeseries()

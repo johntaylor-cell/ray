@@ -287,5 +287,53 @@ def test_stale_replica_arrays_do_not_suppress_handle_running(agg, monkeypatch):
     assert abs(ref_total - mix_total) < 1e-9
 
 
+@pytest.mark.parametrize(
+    "agg", [AggregationFunction.MEAN, AggregationFunction.MAX, AggregationFunction.MIN]
+)
+def test_empty_object_running_series_does_not_suppress_columnar_handle(
+    agg, monkeypatch
+):
+    """Regression (@cursor): in a mixed rollout an object (cloudpickle) replica that
+    reports RUNNING_REQUESTS_KEY with an EMPTY series must NOT flip
+    metrics_collected_on_replicas and suppress columnar handle-side running (which
+    carries the real load). The empty series holds no data; the total must include
+    the handle running and match the all-object twin for every aggregation function."""
+    monkeypatch.setattr(A.time, "time", lambda: NOW + 3.0)
+    live = ReplicaID("r_live", DEP)  # running; running reported on a handle
+    idle = ReplicaID("r_idle", DEP)  # running; reports an EMPTY running series
+    live_str, idle_str = live.to_full_id_str(), idle.to_full_id_str()
+    running = [TimeStampedValue(NOW - 6, 4.0), TimeStampedValue(NOW, 6.0)]
+    queued = [TimeStampedValue(NOW - 6, 2.0), TimeStampedValue(NOW, 3.0)]
+    handle = _handle_report_running("h0", live_str, running, queued)
+    empty_rep = ReplicaMetricReport(
+        replica_id=idle,
+        aggregated_metrics={RUNNING_REQUESTS_KEY: 0.0},
+        metrics={RUNNING_REQUESTS_KEY: []},  # present-but-empty: the flag trigger
+        timestamp=NOW,
+    )
+
+    # All-object twin (reference).
+    ref = _state(agg)
+    ref._handle_requests["h0"] = handle
+    ref._replica_metrics[idle] = empty_rep
+    ref._running_replicas = {live, idle}
+    ref._cached_running_replica_strs = {live_str, idle_str}
+    ref_total = ref._calculate_total_requests_aggregate_mode()
+
+    # Mixed: columnar handle running + object empty-series replica.
+    mix = _state(agg)
+    mix.record_columnar_metrics_for_handle(
+        codec.decode_handle_flat(codec.encode(handle))
+    )
+    mix._replica_metrics[idle] = empty_rep
+    mix._running_replicas = {live, idle}
+    mix._cached_running_replica_strs = {live_str, idle_str}
+    mix_total = mix._calculate_total_requests_aggregate_mode()
+
+    # Handle running must not be suppressed by the empty object series.
+    assert mix_total > 0.0
+    assert abs(ref_total - mix_total) < 1e-9
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", __file__]))
