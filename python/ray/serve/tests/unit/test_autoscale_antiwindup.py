@@ -2,7 +2,10 @@ import sys
 
 import pytest
 
-from ray.serve.autoscaling_policy import replica_queue_length_autoscaling_policy
+from ray.serve.autoscaling_policy import (
+    _apply_autoscaling_config,
+    replica_queue_length_autoscaling_policy,
+)
 from ray.serve.config import AutoscalingConfig, AutoscalingContext
 
 
@@ -18,6 +21,8 @@ def _ctx(current, target, total_requests):
         target_ongoing_requests=1,
         upscaling_factor=1.0,
         downscaling_factor=1.0,
+        upscale_delay_s=0,
+        downscale_delay_s=0,
     )
     return AutoscalingContext(
         config=config,
@@ -41,8 +46,15 @@ def _ctx(current, target, total_requests):
     )
 
 
+# Invoke the policy exactly as production does: the anti-windup cap lives in
+# _apply_default_params, which runs only via the _apply_autoscaling_config wrapper
+# (see DeploymentAutoscalingState._policy). Delays are zeroed above so the wrapper's
+# delay logic is a pass-through and the assertions isolate the scaling-factor + cap.
+_PRODUCTION_POLICY = _apply_autoscaling_config(replica_queue_length_autoscaling_policy)
+
+
 def _desired(ctx):
-    desired, _ = replica_queue_length_autoscaling_policy(ctx)
+    desired, _ = _PRODUCTION_POLICY(ctx)
     return desired
 
 
