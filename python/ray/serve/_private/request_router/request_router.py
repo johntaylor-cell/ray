@@ -31,6 +31,8 @@ from ray.serve._private.constants import (
     DEFAULT_LATENCY_BUCKET_MS,
     RAY_SERVE_MAX_QUEUE_LENGTH_RESPONSE_DEADLINE_S,
     RAY_SERVE_MULTIPLEXED_MODEL_ID_MATCHING_TIMEOUT_S,
+    RAY_SERVE_QUEUE_LEN_PROBE_RTT_EWMA_ALPHA,
+    RAY_SERVE_QUEUE_LEN_PROBE_RTT_MULTIPLIER,
     RAY_SERVE_QUEUE_LENGTH_RESPONSE_DEADLINE_S,
     RAY_SERVE_ROUTER_QUEUE_LEN_GAUGE_THROTTLE_S,
     RAY_SERVE_ROUTER_RETRY_BACKOFF_MULTIPLIER,
@@ -505,6 +507,12 @@ class RequestRouter(ABC):
         # Maps replica_id -> last update timestamp to avoid excessive metric updates.
         self._queue_len_gauge_last_update: Dict[ReplicaID, float] = {}
 
+        # Sticky, latency-adaptive probe deadline: EWMA of recent successful
+        # queue-length probe round-trip times, used to seed the per-request probe
+        # deadline near the cluster's real probe latency instead of re-climbing from
+        # the static base each routing decision. None until the first clean probe.
+        self._probe_rtt_ewma_s: Optional[float] = None
+
         # NOTE(edoakes): Python 3.10 removed the `loop` parameter to `asyncio.Event`.
         # Now, the `asyncio.Event` will call `get_running_loop` in its constructor to
         # determine the loop to attach to. This class can be constructed for the handle
@@ -949,22 +957,50 @@ class RequestRouter(ABC):
             self.max_queue_len_response_deadline_s,
         )
 
+        # Seed the deadline from the EWMA of recent successful probe round-trip
+        # times (padded by RAY_SERVE_QUEUE_LEN_PROBE_RTT_MULTIPLIER), bounded below
+        # by the configured base so a healthy cluster stays at the fast default and
+        # above by the max. This lets the deadline track real probe latency without
+        # re-climbing the exponential backoff from the base every routing decision.
+        adaptive_base_deadline_s = self.queue_len_response_deadline_s
+        if self._probe_rtt_ewma_s is not None:
+            adaptive_base_deadline_s = min(
+                max(
+                    self.queue_len_response_deadline_s,
+                    self._probe_rtt_ewma_s * RAY_SERVE_QUEUE_LEN_PROBE_RTT_MULTIPLIER,
+                ),
+                max_queue_len_response_deadline_s,
+            )
+
         try:
             queue_len_response_deadline_s = min(
-                self.queue_len_response_deadline_s * (2**backoff_index),
+                adaptive_base_deadline_s * (2**backoff_index),
                 max_queue_len_response_deadline_s,
             )
         except OverflowError:
-            # self.queue_len_response_deadline_s * (2**backoff_index)
+            # adaptive_base_deadline_s * (2**backoff_index)
             # can overflow if backoff_index gets sufficiently large (e.g.
-            # 1024 when queue_len_response_deadline_s is 0.1).
+            # 1024 when the base deadline is 0.1).
             queue_len_response_deadline_s = max_queue_len_response_deadline_s
+
+        # Per-replica probe round-trip times, recorded only for replicas that
+        # answer successfully. Folded individually into the EWMA below so the
+        # estimate is independent of how many replicas a round probed -- a one-
+        # replica subset or background round must not drag the deadline below what a
+        # two-replica routing probe needs, nor a large cache-warming batch inflate it.
+        probe_rtts: List[float] = []
+
+        async def _timed_get_queue_len(replica):
+            start = self._event_loop.time()
+            queue_len = await replica.get_queue_len(
+                deadline_s=queue_len_response_deadline_s
+            )
+            probe_rtts.append(self._event_loop.time() - start)
+            return queue_len
 
         get_queue_len_tasks = []
         for r in replicas:
-            t = self._event_loop.create_task(
-                r.get_queue_len(deadline_s=queue_len_response_deadline_s)
-            )
+            t = self._event_loop.create_task(_timed_get_queue_len(r))
             t.replica = r
             get_queue_len_tasks.append(t)
 
@@ -1021,6 +1057,22 @@ class RequestRouter(ABC):
                 result.append((replica, queue_len))
                 self._replica_queue_len_cache.update(replica.replica_id, queue_len)
                 self._update_router_queue_len_gauge(replica.replica_id, queue_len)
+
+        # Fold each successful replica's own round-trip time into the RTT EWMA, but
+        # only for a clean round where EVERY probed replica answered
+        # (len(probe_rtts) == len(replicas)). Per-replica samples keep the estimate
+        # independent of round size; requiring a clean round avoids biasing it low on
+        # a censored/partial round -- a timed-out or errored replica's true RTT
+        # exceeds the deadline and is unknown, so blending in only the fast successes
+        # would understate the deadline the next round needs.
+        if len(probe_rtts) == len(replicas):
+            alpha = RAY_SERVE_QUEUE_LEN_PROBE_RTT_EWMA_ALPHA
+            for rtt in probe_rtts:
+                self._probe_rtt_ewma_s = (
+                    rtt
+                    if self._probe_rtt_ewma_s is None
+                    else (1.0 - alpha) * self._probe_rtt_ewma_s + alpha * rtt
+                )
 
         assert len(result) == len(replicas)
         return result

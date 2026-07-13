@@ -512,6 +512,19 @@ RAY_SERVE_MAX_QUEUE_LENGTH_RESPONSE_DEADLINE_S = get_env_float(
     "RAY_SERVE_MAX_QUEUE_LENGTH_RESPONSE_DEADLINE_S", 1.0
 )
 
+# Sticky, latency-adaptive probe deadline (see RequestRouter._probe_queue_lens):
+# EWMA smoothing factor for recent successful probe round-trip times, and the
+# multiplier applied to that EWMA when seeding the per-request probe deadline.
+# Clamped defensively: alpha to [0, 1] (valid EWMA weight); multiplier to >= 1.0 so
+# the padded deadline can never fall below the observed RTT (which would cause
+# aggressive timeouts).
+RAY_SERVE_QUEUE_LEN_PROBE_RTT_EWMA_ALPHA = min(
+    1.0, max(0.0, get_env_float("RAY_SERVE_QUEUE_LEN_PROBE_RTT_EWMA_ALPHA", 0.3))
+)
+RAY_SERVE_QUEUE_LEN_PROBE_RTT_MULTIPLIER = max(
+    1.0, get_env_float("RAY_SERVE_QUEUE_LEN_PROBE_RTT_MULTIPLIER", 2.0)
+)
+
 # Length of time to respect entries in the queue length cache when routing requests.
 RAY_SERVE_QUEUE_LENGTH_CACHE_TIMEOUT_S = get_env_float_non_negative(
     "RAY_SERVE_QUEUE_LENGTH_CACHE_TIMEOUT_S", 10.0
