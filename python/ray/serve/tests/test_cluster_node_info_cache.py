@@ -65,7 +65,7 @@ def test_refresh_async_stages_without_touching_live_cache():
 
     async def _run():
         cache = DefaultClusterNodeInfoCache(object())  # GCS is never called
-        cache._compute_snapshot = lambda: _NEW
+        cache._compute_snapshot = lambda *a: _NEW
         assert cache.get_alive_nodes() is None  # nothing applied yet
 
         await cache.refresh_async()
@@ -87,7 +87,7 @@ def test_apply_pending_is_noop_without_staged_snapshot():
 
     async def _run():
         cache = DefaultClusterNodeInfoCache(object())
-        cache._compute_snapshot = lambda: _OLD
+        cache._compute_snapshot = lambda *a: _OLD
         cache.update()  # seed the live cache synchronously
         assert cache.get_alive_nodes() == _OLD[0]
 
@@ -103,7 +103,7 @@ def test_update_applies_synchronously():
 
     async def _run():
         cache = DefaultClusterNodeInfoCache(object())
-        cache._compute_snapshot = lambda: _NEW
+        cache._compute_snapshot = lambda *a: _NEW
         cache.update()
         assert cache.get_alive_nodes() == _NEW[0]
 
@@ -121,13 +121,13 @@ def test_live_cache_frozen_while_refresh_in_flight():
         loop = asyncio.get_running_loop()
 
         # Seed a known live snapshot.
-        cache._compute_snapshot = lambda: _OLD
+        cache._compute_snapshot = lambda *a: _OLD
         cache.update()
         assert cache.get_alive_nodes() == _OLD[0]
 
         # Route the executor step to a future we resolve by hand.
         exec_future = loop.create_future()
-        loop.run_in_executor = lambda executor, fn: exec_future
+        loop.run_in_executor = lambda executor, fn, *a: exec_future
 
         task = asyncio.create_task(cache.refresh_async())
         await asyncio.sleep(0)  # let it suspend on the future
@@ -153,12 +153,12 @@ def test_refresh_async_single_flight():
         calls = {"n": 0}
         exec_future = loop.create_future()
 
-        def _run_in_executor(executor, fn):
+        def _run_in_executor(executor, fn, *a):
             calls["n"] += 1
             return exec_future
 
         loop.run_in_executor = _run_in_executor
-        cache._compute_snapshot = lambda: _NEW
+        cache._compute_snapshot = lambda *a: _NEW
 
         first = asyncio.create_task(cache.refresh_async())
         await asyncio.sleep(0)
@@ -169,6 +169,31 @@ def test_refresh_async_single_flight():
         exec_future.set_result(_NEW)
         await first
         assert calls["n"] == 1
+
+
+def test_refresh_async_captures_prior_state_before_executor():
+    """refresh_async snapshots the carry-forward state on the event loop and hands it to
+    the executor, so _compute_snapshot never reads self off-thread (guards against a
+    concurrent apply_pending() mutating self mid-compute)."""
+
+    async def _run():
+        cache = DefaultClusterNodeInfoCache(object())
+        cache._apply_snapshot(_OLD)  # live cache now holds _OLD's alive-id set
+
+        captured = {}
+
+        def _compute(prior):
+            captured["prior"] = prior
+            return _NEW
+
+        cache._compute_snapshot = _compute
+        await cache.refresh_async()
+
+        # prior[0] is the alive-id set, captured from self at call time (== _OLD), not
+        # read from self inside the executor.
+        assert captured["prior"][0] == _OLD[1]
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
