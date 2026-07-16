@@ -24,35 +24,36 @@ class ClusterNodeInfoCache(ABC):
         # rebuilding labels / total resources when nothing changed.
         self._alive_node_id_set: FrozenSet[str] = frozenset()
         self._refresh_in_flight: bool = False
-        # Monotonic epoch stamped when a refresh/update is ISSUED. A late
-        # async apply whose issuing op started before an already-applied op
-        # is dropped, so an in-flight refresh_async cannot clobber a newer
-        # snapshot (e.g. the synchronous shutdown update() applied while the
-        # async refresh was still suspended in the executor).
-        self._refresh_epoch: int = 0
-        self._applied_epoch: int = 0
+        # Snapshot staged by the background refresh_async() and promoted into the live
+        # cache by apply_pending() at the top of a control-loop tick. Staging (rather
+        # than applying inline when the executor completes) keeps the live cache from
+        # being mutated mid-tick, so every reader within a tick sees a consistent view.
+        self._pending_snapshot: Optional[Tuple] = None
 
     def update(self):
-        """Update the cache by fetching latest node information from GCS (blocking)."""
-        epoch = self._next_epoch()
-        self._apply_snapshot(self._compute_snapshot(), epoch)
+        """Update the cache by fetching latest node information from GCS (blocking).
+
+        Applies synchronously. Used at controller startup (to warm the cache before the
+        control loop starts) and on the shutdown path, where the background refresh loop
+        has already exited.
+        """
+        self._apply_snapshot(self._compute_snapshot())
 
     async def refresh_async(self):
-        """Non-blocking node-info refresh. The GCS calls release the
-        GIL (with nogil), so running _compute_snapshot in an executor lets the
-        control loop keep running while a slow GCS reply is in flight; the snapshot is
-        applied on the event-loop thread (race-free). One refresh in flight at a time."""
+        """Non-blocking node-info refresh. The GCS calls release the GIL (with nogil),
+        so running _compute_snapshot in an executor lets the control loop keep running
+        while a slow GCS reply is in flight. The result is STAGED, not applied: the
+        control loop promotes it into the live cache via apply_pending() at the top of
+        the next tick, so the live cache is never mutated mid-tick. One refresh in
+        flight at a time."""
         if self._refresh_in_flight:
             return
         self._refresh_in_flight = True
         try:
-            # Stamp the epoch at ISSUE time (before the executor await) so a
-            # refresh/update started later -- e.g. the shutdown update() -- wins
-            # over this one regardless of which GCS reply returns first.
-            epoch = self._next_epoch()
             loop = asyncio.get_running_loop()
-            snapshot = await loop.run_in_executor(None, self._compute_snapshot)
-            self._apply_snapshot(snapshot, epoch)
+            self._pending_snapshot = await loop.run_in_executor(
+                None, self._compute_snapshot
+            )
         except Exception:
             logger.warning(
                 "Async node-info refresh failed; node info cache will be stale.",
@@ -61,20 +62,25 @@ class ClusterNodeInfoCache(ABC):
         finally:
             self._refresh_in_flight = False
 
-    def _next_epoch(self) -> int:
-        self._refresh_epoch += 1
-        return self._refresh_epoch
+    def apply_pending(self) -> None:
+        """Promote the most recent background snapshot (if any) into the live cache.
 
-    def _apply_snapshot(self, snapshot, epoch):
-        # Drop a stale apply whose issuing refresh/update started before one that
-        # already landed (epochs are unique + monotonic, so `<` suffices). This is
-        # what stops an in-flight async refresh from overwriting the newer snapshot
-        # written by the synchronous shutdown update().
-        if epoch < self._applied_epoch:
-            return
-        self._applied_epoch = epoch
+        Called synchronously at the top of each control-loop tick, before any reader, so
+        the live cache is immutable for the tick's duration -- every component within a
+        tick (reconciler, proxy state, target-group broadcast) sees one consistent
+        node-info view. This restores the invariant the old per-cycle update() held,
+        while the GCS fetch stays off the event loop in refresh_async().
+        """
+        snapshot = self._pending_snapshot
+        if snapshot is not None:
+            self._pending_snapshot = None
+            self._apply_snapshot(snapshot)
+
+    def _apply_snapshot(self, snapshot):
         # No await between assignments -> atomic on the event loop; readers never see a
-        # partially-updated cache.
+        # partially-updated cache. Only ever called on the event-loop thread, from
+        # update() (synchronous) and apply_pending() (tick boundary) -- never inline from
+        # the background refresh -- so the live cache is not mutated mid-tick.
         (
             self._cached_alive_nodes,
             self._alive_node_id_set,

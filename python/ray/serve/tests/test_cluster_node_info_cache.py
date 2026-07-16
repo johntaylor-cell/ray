@@ -57,59 +57,118 @@ _OLD = ([("old", "old", "")], frozenset({"old"}), {}, {}, {})
 _NEW = ([("new", "new", "")], frozenset({"new"}), {}, {}, {})
 
 
-def test_shutdown_update_not_clobbered_by_stale_async_refresh():
-    """A slow in-flight refresh_async must not overwrite a newer snapshot applied by
-    the synchronous update() while the async was suspended in the executor -- the
-    controller's shutdown path. The epoch guard rejects the stale late apply.
-    """
+def test_refresh_async_stages_without_touching_live_cache():
+    """refresh_async must NOT mutate the live cache when the executor completes -- it
+    only STAGES the snapshot. The live cache changes only when apply_pending() runs (at
+    the control-loop tick boundary), so a background refresh can never land mid-tick.
+    This is the invariant the per-cycle update() used to guarantee."""
 
     async def _run():
         cache = DefaultClusterNodeInfoCache(object())  # GCS is never called
-        loop = asyncio.get_running_loop()
-        # Route the executor step to a future we resolve by hand so we control
-        # exactly when the in-flight async refresh resumes.
-        exec_future = loop.create_future()
-        loop.run_in_executor = lambda executor, fn: exec_future
-
-        # An async refresh is issued first and suspends waiting on the executor.
-        task = asyncio.create_task(cache.refresh_async())
-        await asyncio.sleep(0)  # let it stamp its epoch and suspend on the future
-
-        # Shutdown path: the synchronous update() applies a NEWER snapshot.
         cache._compute_snapshot = lambda: _NEW
-        cache.update()
-        assert cache.get_alive_nodes() == _NEW[0]
+        assert cache.get_alive_nodes() is None  # nothing applied yet
 
-        # The stale executor result now lands; the epoch guard must reject it.
-        exec_future.set_result(_OLD)
-        await task
-        assert cache.get_alive_nodes() == _NEW[0]  # NOT clobbered by stale _OLD
+        await cache.refresh_async()
+        # Staged, but the LIVE cache is untouched.
+        assert cache._pending_snapshot == _NEW
+        assert cache.get_alive_nodes() is None
+
+        # The tick-boundary swap promotes it.
+        cache.apply_pending()
+        assert cache.get_alive_nodes() == _NEW[0]
+        assert cache._pending_snapshot is None  # consumed
 
     asyncio.run(_run())
 
 
-def test_async_refresh_issued_after_update_still_applies():
-    """Mirror check: an async refresh issued AFTER an update() must still win -- the
-    guard rejects only strictly-older applies, never a legitimately newer one.
-    """
+def test_apply_pending_is_noop_without_staged_snapshot():
+    """apply_pending() with nothing staged leaves the live cache unchanged, so ticks
+    with no completed refresh keep the last snapshot."""
+
+    async def _run():
+        cache = DefaultClusterNodeInfoCache(object())
+        cache._compute_snapshot = lambda: _OLD
+        cache.update()  # seed the live cache synchronously
+        assert cache.get_alive_nodes() == _OLD[0]
+
+        cache.apply_pending()  # nothing staged
+        assert cache.get_alive_nodes() == _OLD[0]  # unchanged
+
+    asyncio.run(_run())
+
+
+def test_update_applies_synchronously():
+    """update() (startup + shutdown path) still fetches and applies in one blocking
+    call, independent of the staging mechanism."""
+
+    async def _run():
+        cache = DefaultClusterNodeInfoCache(object())
+        cache._compute_snapshot = lambda: _NEW
+        cache.update()
+        assert cache.get_alive_nodes() == _NEW[0]
+
+    asyncio.run(_run())
+
+
+def test_live_cache_frozen_while_refresh_in_flight():
+    """End-to-end of the reviewer's concern: while a refresh is suspended in the
+    executor, the live cache stays frozen, and when the executor result finally lands it
+    is STAGED (not applied), so an in-flight refresh cannot clobber a snapshot a reader
+    is mid-tick on -- including one written by a synchronous shutdown update()."""
 
     async def _run():
         cache = DefaultClusterNodeInfoCache(object())
         loop = asyncio.get_running_loop()
 
+        # Seed a known live snapshot.
         cache._compute_snapshot = lambda: _OLD
-        cache.update()  # epoch 1
+        cache.update()
         assert cache.get_alive_nodes() == _OLD[0]
 
+        # Route the executor step to a future we resolve by hand.
         exec_future = loop.create_future()
         loop.run_in_executor = lambda executor, fn: exec_future
-        task = asyncio.create_task(cache.refresh_async())  # epoch 2, issued later
-        await asyncio.sleep(0)
+
+        task = asyncio.create_task(cache.refresh_async())
+        await asyncio.sleep(0)  # let it suspend on the future
+        # Live cache is still the seeded snapshot while the refresh is in flight.
+        assert cache.get_alive_nodes() == _OLD[0]
+
+        # The executor result lands: it is STAGED, not applied.
         exec_future.set_result(_NEW)
         await task
-        assert cache.get_alive_nodes() == _NEW[0]  # newer refresh wins
+        assert cache.get_alive_nodes() == _OLD[0]  # live cache still frozen
+        assert cache._pending_snapshot == _NEW  # staged for the next tick
 
     asyncio.run(_run())
+
+
+def test_refresh_async_single_flight():
+    """Only one refresh may be in flight; a concurrent call returns immediately without
+    issuing a second executor job."""
+
+    async def _run():
+        cache = DefaultClusterNodeInfoCache(object())
+        loop = asyncio.get_running_loop()
+        calls = {"n": 0}
+        exec_future = loop.create_future()
+
+        def _run_in_executor(executor, fn):
+            calls["n"] += 1
+            return exec_future
+
+        loop.run_in_executor = _run_in_executor
+        cache._compute_snapshot = lambda: _NEW
+
+        first = asyncio.create_task(cache.refresh_async())
+        await asyncio.sleep(0)
+        # A second call while the first is in flight is a no-op.
+        await cache.refresh_async()
+        assert calls["n"] == 1
+
+        exec_future.set_result(_NEW)
+        await first
+        assert calls["n"] == 1
 
 
 if __name__ == "__main__":

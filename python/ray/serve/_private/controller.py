@@ -610,6 +610,13 @@ class ServeController:
                 self.shutdown()
             except Exception:
                 logger.exception("Exception during shutdown.")
+        else:
+            # Promote the most recent background node-info snapshot into the live cache
+            # once, before this tick's readers (deployment/application state managers,
+            # proxy state), so every component sees one consistent node-info view for the
+            # whole tick. The GCS fetch already ran off the event loop in
+            # _node_info_refresh_loop; this is just a cheap pointer swap.
+            self.cluster_node_info_cache.apply_pending()
 
         if (
             not self.done_recovering_event.is_set()
