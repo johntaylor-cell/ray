@@ -1571,5 +1571,31 @@ class TestAppLevelPolicyStateIsolation:
         assert final_state[d2]["counter"] == 5
 
 
+def test_last_decision_total_num_requests_reuses_decision_value():
+    """The scale up/down log reuses the aggregate computed for the decision.
+
+    `record_autoscaling_metrics` (called once per decision) stashes the total-request
+    value; `get_last_decision_total_num_requests` returns it without re-running the
+    O(replicas + handles) aggregation.
+    """
+    st = DeploymentAutoscalingState(DeploymentID("D", "default"))
+    st._config = AutoscalingConfig(
+        min_replicas=1, max_replicas=100, target_ongoing_requests=1
+    )
+    with patch.object(
+        st, "get_total_num_requests", wraps=st.get_total_num_requests
+    ) as agg_spy:
+        st.record_autoscaling_metrics(
+            decision_num_replicas=3,
+            total_num_requests=42.0,
+            policy_execution_time_ms=1.0,
+            policy_scope="deployment",
+        )
+        # The value recorded for the decision is returned as-is...
+        assert st.get_last_decision_total_num_requests() == 42.0
+        # ...and reading it must NOT trigger a fresh aggregation.
+        assert agg_spy.call_count == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", "-s", __file__]))
