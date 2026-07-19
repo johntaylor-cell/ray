@@ -1,4 +1,5 @@
 import sys
+import time
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
@@ -6,6 +7,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
+import ray.serve._private.deployment_state as ds_mod
 from ray._common.ray_constants import DEFAULT_MAX_CONCURRENCY_ASYNC
 from ray._raylet import NodeID
 from ray.serve._private.autoscaling_state import AutoscalingStateManager
@@ -50,6 +52,7 @@ from ray.serve._private.deployment_state import (
     DeploymentState,
     DeploymentStateManager,
     DeploymentVersion,
+    ReplicaHealthPushRegistry,
     ReplicaStartupStatus,
     ReplicaStateContainer,
 )
@@ -9969,3 +9972,123 @@ def test_dirty_set_gauge_prunes_ids_no_longer_running(
 
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", "-s", __file__]))
+
+
+class TestPushedHealth:
+    """Replica-pushed self-health short-circuits the pull probe; stale or absent
+    pushes fall back to the pull path unchanged."""
+
+    def _wrapper(self):
+        w = ActorReplicaWrapper.__new__(ActorReplicaWrapper)
+        w._actor_handle = Mock()
+        w._actor_handle.check_health.remote.return_value = "probe_ref"
+        w._health_check_ref = None
+        w._last_health_check_time = time.time()
+        w._consecutive_health_check_failures = 0
+        w._healthy = True
+        w._replica_id = "test_replica"
+        w._pushed_health = None
+        w._last_consumed_push_ts = 0.0
+        w._last_push_consume_time = 0.0
+        w._version = SimpleNamespace(
+            deployment_config=SimpleNamespace(health_check_period_s=10.0)
+        )
+        return w
+
+    def test_fresh_healthy_push_defers_pull_probe(self):
+        w = self._wrapper()
+        w._last_health_check_time = 0.0  # probe would fire without the push
+        now = time.time()
+        w.record_pushed_health(now, now, True)
+        assert w.check_health() is True
+        w._actor_handle.check_health.remote.assert_not_called()
+        assert w._health_check_ref is None
+        assert w._last_push_consume_time > 0.0  # probe gated while pushes flow
+
+    def test_stale_push_falls_back_to_pull_probe(self):
+        w = self._wrapper()
+        w._last_health_check_time = 0.0
+        w.record_pushed_health(time.time() - 60.0, time.time() - 60.0, True)
+        assert w.check_health() is True
+        w._actor_handle.check_health.remote.assert_called_once()
+
+    def test_unhealthy_pushes_count_toward_threshold(self):
+        w = self._wrapper()
+        threshold = ds_mod.REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD
+        for i in range(threshold):
+            w.record_pushed_health(time.time() + i * 1e-3, time.time(), False)
+            w.check_health()
+        assert w._healthy is False
+        assert w._consecutive_health_check_failures == threshold
+
+    def test_push_deduped_by_timestamp(self):
+        w = self._wrapper()
+        ts = time.time()
+        w.record_pushed_health(ts, ts, False)
+        w.check_health()
+        w.record_pushed_health(ts, ts, False)  # same observation again
+        w.check_health()
+        assert w._consecutive_health_check_failures == 1
+
+    def test_pushed_count_is_mirrored(self):
+        w = self._wrapper()
+        w.record_pushed_health(time.time(), time.time(), False, 7)
+        w.check_health()
+        assert w._consecutive_health_check_failures == 7
+        assert w._healthy is False
+
+    def test_healthy_push_resets_failure_count(self):
+        w = self._wrapper()
+        w.record_pushed_health(time.time(), time.time(), False)
+        w.check_health()
+        assert w._consecutive_health_check_failures == 1
+        w.record_pushed_health(time.time() + 1e-3, time.time(), True)
+        assert w.check_health() is True
+        assert w._consecutive_health_check_failures == 0
+
+
+class TestPushedHealthReviewRegressions:
+    """Regressions for the agent-review findings on the push-health PR."""
+
+    def test_registry_rejects_out_of_order_reports(self):
+        r = ReplicaHealthPushRegistry()
+        r.record("r1", checked_at=200.0, healthy=True)
+        r.record("r1", checked_at=100.0, healthy=False)  # delayed older report
+        checked_at, _received_at, healthy, _cnt = r.get("r1")
+        assert checked_at == 200.0 and healthy is True
+
+    def test_resolved_probe_does_not_discard_fresh_push(self, monkeypatch):
+        w = TestPushedHealth._wrapper(TestPushedHealth())
+        # An in-flight probe resolves SUCCEEDED this tick...
+        w._health_check_ref = "probe_ref"
+        monkeypatch.setattr(ds_mod, "check_obj_ref_ready_nowait", lambda r: True)
+        monkeypatch.setattr(ds_mod.ray, "get", lambda r: None)
+        now = time.time()
+        w.record_pushed_health(now, now, False, 1)
+        assert w.check_health() is True  # probe result wins this tick
+        assert w._pushed_health is not None  # ...but the push stays stashed
+        # Next tick (no probe): the push is consumed.
+        assert w.check_health() is True
+        assert w._consecutive_health_check_failures == 1
+
+
+def test_apply_pushed_health_hands_off_to_wrapper():
+    """DeploymentState routes registry entries to the replica wrapper; absent
+    entries or registry leave the pull path untouched."""
+    ds = DeploymentState.__new__(DeploymentState)
+    ds._health_push_registry = ReplicaHealthPushRegistry()
+    rep = Mock()
+    rep.replica_id.unique_id = "r1"
+    ds._health_push_registry.record("r1", 123.0, True)
+    DeploymentState._apply_pushed_health(ds, rep)
+    args = rep.record_pushed_health.call_args.args
+    assert args[0] == 123.0 and args[2] is True and args[3] is None
+
+    rep2 = Mock()
+    rep2.replica_id.unique_id = "r2"
+    DeploymentState._apply_pushed_health(ds, rep2)
+    rep2.record_pushed_health.assert_not_called()
+
+    ds._health_push_registry = None
+    DeploymentState._apply_pushed_health(ds, rep2)
+    rep2.record_pushed_health.assert_not_called()
