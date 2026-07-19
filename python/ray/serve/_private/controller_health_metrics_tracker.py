@@ -80,6 +80,16 @@ class ControllerHealthMetricsTracker:
     num_control_loops: int = 0
     last_control_loop_time: float = 0.0
 
+    # Health-check deadline staleness (dirty-set sweep study; set by the controller loop).
+    health_deadline_misses: int = 0
+    health_checks_recorded: int = 0
+    health_max_lateness_s: float = 0.0
+    health_max_gap_s: float = 0.0
+    health_gap_p50_s: float = 0.0
+    health_gap_p90_s: float = 0.0
+    health_gap_p99_s: float = 0.0
+    health_gap_p99_9_s: float = 0.0
+
     def record_loop_duration(self, duration: float):
         self.loop_durations.append(duration)
 
@@ -209,4 +219,12 @@ class ControllerHealthMetricsTracker:
             ingest_reports_received=ingest_reports_received,
             ingest_cpu_fraction=ingest_cpu_fraction,
             process_memory_mb=process_memory_mb,
+            health_deadline_misses=self.health_deadline_misses,
+            health_checks_recorded=self.health_checks_recorded,
+            health_max_lateness_s=self.health_max_lateness_s,
+            health_max_gap_s=self.health_max_gap_s,
+            health_gap_p50_s=self.health_gap_p50_s,
+            health_gap_p90_s=self.health_gap_p90_s,
+            health_gap_p99_s=self.health_gap_p99_s,
+            health_gap_p99_9_s=self.health_gap_p99_9_s,
         )

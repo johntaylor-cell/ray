@@ -110,6 +110,11 @@ from ray.util.placement_group import PlacementGroup
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
+# Health-check gap histogram (measurement-only): 0.5s buckets to 200s, for staleness
+# percentiles in the sweep study.
+_HC_GAP_BUCKET_S = 0.5
+_HC_GAP_NBUCKETS = 400
+
 _RESERVED_INTERNAL_DEPLOYMENT_CONTEXT_ENV_VARS = {
     RAY_SERVE_INTERNAL_DEPLOYMENT_APP_NAME_ENV_VAR,
     RAY_SERVE_INTERNAL_DEPLOYMENT_NAME_ENV_VAR,
@@ -2931,6 +2936,15 @@ class DeploymentState:
         self._health_gauge_cache: Dict[str, Tuple[int, float]] = {}
         self._last_health_check_healthy_replica_ids: Set[str] = set()
 
+        # Health-check staleness (measurement-only; dirty-set sweep study). Gap between a
+        # replica's consecutive RR schedulings = its health-info staleness.
+        self._last_sched_ts: Dict[str, float] = {}
+        self._hc_checks = 0
+        self._hc_deadline_misses = 0
+        self._hc_max_lateness_s = 0.0
+        self._hc_max_gap_s = 0.0
+        self._gap_hist = [0] * _HC_GAP_NBUCKETS
+
         # Maintain gang membership bookkeeping to avoid O(num_replicas) lookups when stopping gangs.
         # Updated on replica creation during upscaling and permanent removal during downscaling.
         self._gang_id_by_replica: Dict[ReplicaID, str] = {}
@@ -4648,6 +4662,30 @@ class DeploymentState:
             else:
                 self.health_check_failures_counter.inc()
 
+    def _note_schedule(self, rid) -> None:
+        """Measurement-only: gap between a replica's consecutive dirty-set health-check
+        schedulings = its health-info staleness. Track max gap + deadline misses (gap
+        beyond the reconcile period the sweep must keep pace with)."""
+        try:
+            now = time.time()
+            last = self._last_sched_ts.get(rid)
+            self._last_sched_ts[rid] = now
+            if last is None:
+                return
+            gap = now - last
+            self._hc_checks += 1
+            if gap > self._hc_max_gap_s:
+                self._hc_max_gap_s = gap
+            _b = int(gap / _HC_GAP_BUCKET_S)
+            self._gap_hist[_b if _b < _HC_GAP_NBUCKETS else _HC_GAP_NBUCKETS - 1] += 1
+            overdue = gap - self._reconcile_sweep_period_s()
+            if overdue > 0:
+                self._hc_deadline_misses += 1
+                if overdue > self._hc_max_lateness_s:
+                    self._hc_max_lateness_s = overdue
+        except Exception:
+            pass
+
     def _process_healthy_replica(self, replica) -> None:
         """Set the health gauge and pull/broadcast routing stats for a healthy replica.
 
@@ -4721,6 +4759,7 @@ class DeploymentState:
                 if replica.replica_id not in seen:
                     pairs.append((replica, ReplicaState.RUNNING))
                     seen.add(replica.replica_id)
+                    self._note_schedule(replica.replica_id.unique_id)
         return pairs
 
     def _reconcile_sweep_period_s(self) -> float:
@@ -5665,6 +5704,37 @@ class DeploymentStateManager:
         self._recover_from_checkpoint(
             all_current_actor_names, all_current_placement_group_names
         )
+
+    def get_health_deadline_stats(self) -> Dict[str, float]:
+        """Aggregate health-check deadline-miss stats across deployments (measurement-only)."""
+        misses = checks = 0
+        max_late = max_gap = 0.0
+        hist = [0] * _HC_GAP_NBUCKETS
+        for ds in self._deployment_states.values():
+            misses += getattr(ds, "_hc_deadline_misses", 0)
+            checks += getattr(ds, "_hc_checks", 0)
+            max_late = max(max_late, getattr(ds, "_hc_max_lateness_s", 0.0))
+            max_gap = max(max_gap, getattr(ds, "_hc_max_gap_s", 0.0))
+            dh = getattr(ds, "_gap_hist", None)
+            if dh:
+                for i, c in enumerate(dh):
+                    hist[i] += c
+        total = sum(hist)
+
+        def _pct(p):
+            if total <= 0:
+                return 0.0
+            target = p * total
+            cum = 0
+            for i, c in enumerate(hist):
+                cum += c
+                if cum >= target:
+                    return (i + 1) * _HC_GAP_BUCKET_S
+            return _HC_GAP_NBUCKETS * _HC_GAP_BUCKET_S
+
+        return {"misses": misses, "checks": checks, "max_lateness_s": max_late,
+                "max_gap_s": max_gap, "gap_p50_s": _pct(0.50), "gap_p90_s": _pct(0.90),
+                "gap_p99_s": _pct(0.99), "gap_p99_9_s": _pct(0.999)}
 
     def _create_deployment_state(self, deployment_id):
         self._deployment_scheduler.on_deployment_created(

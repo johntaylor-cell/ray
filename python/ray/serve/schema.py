@@ -1641,6 +1641,26 @@ class ControllerHealthMetrics(BaseModel):
         default=0.0, description="When the controller started (epoch seconds)."
     )
     uptime_s: float = Field(default=0.0, description="Controller uptime in seconds.")
+
+    # Health-check deadline staleness (dirty-set sweep study).
+    health_deadline_misses: int = Field(
+        default=0,
+        description="Health checks whose gap since the replica prior check exceeded health_check_period_s.",
+    )
+    health_checks_recorded: int = Field(
+        default=0, description="Total health checks measured for deadline staleness."
+    )
+    health_max_lateness_s: float = Field(
+        default=0.0, description="Max seconds a health check ran past its deadline."
+    )
+    health_max_gap_s: float = Field(
+        default=0.0,
+        description="Max seconds between a replica's consecutive dirty-set health-check schedulings (staleness).",
+    )
+    health_gap_p50_s: float = Field(default=0.0, description="Median health-check gap (staleness).")
+    health_gap_p90_s: float = Field(default=0.0, description="p90 health-check gap.")
+    health_gap_p99_s: float = Field(default=0.0, description="p99 health-check gap: deadline 99%% of checks meet.")
+    health_gap_p99_9_s: float = Field(default=0.0, description="p99.9 health-check gap.")
     last_control_loop_time: float = Field(
         default=0.0,
         description="Time of the last control loop execution (epoch seconds).",

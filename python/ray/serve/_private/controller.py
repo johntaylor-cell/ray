@@ -728,6 +728,18 @@ class ServeController:
             dsm_duration = time.time() - dsm_update_start_time
             self.dsm_update_duration_gauge_s.set(dsm_duration)
             self._health_metrics_tracker.record_dsm_update_duration(dsm_duration)
+            try:
+                _dl = self.deployment_state_manager.get_health_deadline_stats()
+                self._health_metrics_tracker.health_deadline_misses = _dl["misses"]
+                self._health_metrics_tracker.health_checks_recorded = _dl["checks"]
+                self._health_metrics_tracker.health_max_lateness_s = _dl["max_lateness_s"]
+                self._health_metrics_tracker.health_max_gap_s = _dl["max_gap_s"]
+                self._health_metrics_tracker.health_gap_p50_s = _dl["gap_p50_s"]
+                self._health_metrics_tracker.health_gap_p90_s = _dl["gap_p90_s"]
+                self._health_metrics_tracker.health_gap_p99_s = _dl["gap_p99_s"]
+                self._health_metrics_tracker.health_gap_p99_9_s = _dl["gap_p99_9_s"]
+            except Exception:
+                pass
             if not self.done_recovering_event.is_set() and not any_recovering:
                 self.done_recovering_event.set()
                 if num_loops > 0:
