@@ -9789,6 +9789,14 @@ class TestDirtySet:
         s._replicas = container
         s._outstanding_dirty_set = set()
         s._dirty_set_rr_cursor = 0
+        # Benchmark-instrumentation hook state (schedule-gap histogram).
+        s._last_sched_ts = {}
+        s._hc_checks = 0
+        s._hc_deadline_misses = 0
+        s._hc_max_lateness_s = 0.0
+        s._hc_max_gap_s = 0.0
+        s._gap_hist = [0] * ds_mod._HC_GAP_NBUCKETS
+        s._note_schedule = DeploymentState._note_schedule.__get__(s)
         s._target_state = object()  # .info access raises -> default reconcile period
         # Bind the real period helper so _dirty_set_active_pairs can call it on the shim.
         s._reconcile_sweep_period_s = DeploymentState._reconcile_sweep_period_s.__get__(
