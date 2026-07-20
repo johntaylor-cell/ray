@@ -40,6 +40,10 @@ _DEADLINE_KEYS = (
     "health_gap_p90_s",
     "health_gap_p99_s",
     "health_gap_p99_9_s",
+    "push_checks_recorded",
+    "push_check_gap_p50_s",
+    "push_check_gap_p99_s",
+    "push_check_gap_max_s",
 )
 
 
@@ -133,6 +137,9 @@ async def main():
                     "health_max_gap_s": last.get("health_max_gap_s"),
                     "health_gap_p90_s": last.get("health_gap_p90_s"),
                     "health_gap_p99_s": last.get("health_gap_p99_s"),
+                    "push_check_gap_p99_s": last.get("push_check_gap_p99_s"),
+                    "push_check_gap_max_s": last.get("push_check_gap_max_s"),
+                    "push_checks_recorded": last.get("push_checks_recorded"),
                 }), flush=True)
         except Exception as e:
             print("SCALE16K_FAIL N=%d %r" % (N, e), flush=True)
