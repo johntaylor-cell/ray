@@ -60,9 +60,12 @@ async def _pinned_checkpoint(handle, signal_actor, checkpoint, target_replicas, 
     """Reach target replicas FIRST (no load), THEN apply steady load + sample."""
     start_time = time.time()
     await cmn._controller_wait_for_replicas_up(int(target_replicas * 0.95), timeout=WAITER)
+    print("SCALE16K_PHASE replicas_up", flush=True)
     await cmn._controller_wait_for_deployment_healthy(timeout=WAITER)
+    print("SCALE16K_PHASE deployment_healthy", flush=True)
     autoscale_duration_s = time.time() - start_time
     pending_requests = [handle.remote() for _ in range(int(target_replicas * LOAD_MULT))]
+    print("SCALE16K_PHASE load_dispatched", flush=True)
     try:
         await cmn._controller_wait_for_waiters(
             signal_actor, len(pending_requests),
@@ -70,6 +73,7 @@ async def _pinned_checkpoint(handle, signal_actor, checkpoint, target_replicas, 
         )
     except RuntimeError as _e:
         print("SCALE16K_WAITER_PARTIAL " + repr(str(_e)), flush=True)
+    print("SCALE16K_PHASE sampling_start", flush=True)
     samples = []
     num_samples = marin_s // sample_s
     for sample_idx in range(num_samples):
@@ -113,7 +117,9 @@ async def main():
                 ray_actor_options={"num_cpus": NUM_CPUS},
                 autoscaling_config=_autoscaling(N),
             ).bind(hello)
+            print("SCALE16K_PHASE serve_run_start", flush=True)
             handle = serve.run(app, name="default", route_prefix=None)
+            print("SCALE16K_PHASE serve_run_done", flush=True)
             samples = await _pinned_checkpoint(handle, signal, i, N, MARIN, SAMPLE)
             for s in samples:
                 print("SCALE16K_SAMPLE " + json.dumps(s), flush=True)
