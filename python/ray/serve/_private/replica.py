@@ -48,9 +48,9 @@ from ray.serve._private import autoscaling_metrics_codec
 from ray.serve._private.common import (
     RUNNING_REQUESTS_KEY,
     DeploymentID,
+    ReplicaHealthFrame,
     ReplicaID,
     ReplicaMetricReport,
-    ReplicaHealthFrame,
     ReplicaQueueLengthInfo,
     RequestMetadata,
     RequestProtocol,
