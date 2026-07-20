@@ -528,6 +528,27 @@ class ServeController:
         application = handle_metric_report.deployment_id.app_name
 
         self._observe_handle_metrics_delay(latency_ms, deployment, application)
+        # Record the metrics delay for observability. A histogram lets Prometheus
+        # aggregate reports from all handles of a deployment, so we omit the
+        # per-handle tag to keep cardinality bounded.
+        self.handle_metrics_delay_histogram.observe(
+            latency_ms,
+            tags={
+                "deployment": deployment,
+                "application": application,
+            },
+        )
+        # Track in health metrics
+        self._health_metrics_tracker.record_handle_metrics_delay(latency_ms)
+        if handle_metric_report.replica_health:
+            for _rid, (
+                _checked_at,
+                _healthy,
+                _failures,
+            ) in handle_metric_report.replica_health.items():
+                self._replica_health_push_registry.record(
+                    _rid, _checked_at, _healthy, _failures
+                )
         self.autoscaling_state_manager.record_request_metrics_for_handle(
             handle_metric_report
         )
@@ -761,6 +782,11 @@ class ServeController:
                 self._health_metrics_tracker.health_gap_p90_s = _dl["gap_p90_s"]
                 self._health_metrics_tracker.health_gap_p99_s = _dl["gap_p99_s"]
                 self._health_metrics_tracker.health_gap_p99_9_s = _dl["gap_p99_9_s"]
+                _gs = self._replica_health_push_registry.gap_stats()
+                self._health_metrics_tracker.push_checks_recorded = _gs["count"]
+                self._health_metrics_tracker.push_check_gap_p50_s = _gs["p50_s"]
+                self._health_metrics_tracker.push_check_gap_p99_s = _gs["p99_s"]
+                self._health_metrics_tracker.push_check_gap_max_s = _gs["max_s"]
             except Exception:
                 pass
             if not self.done_recovering_event.is_set() and not any_recovering:

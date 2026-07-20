@@ -1378,8 +1378,13 @@ class TestSelfHealthPush:
         m._self_health_checked_at = None
         m._self_health_timeout_s = 1.0
         m._pushing_metric_reports = pushing_reports
+        m._autoscaling_config = (
+            SimpleNamespace(metrics_interval_s=10.0) if pushing_reports else None
+        )
+        m._self_health_period_s = 10.0
         m._pending_health_push_ref = None
         m._self_consecutive_failures = 0
+        m._last_health_carried_ts = None
         m._metrics_push_lock = threading.Lock()
         m._controller_handle = Mock()
         m._replica_id = SimpleNamespace(unique_id="r1")
@@ -1455,6 +1460,87 @@ class TestSelfHealthPush:
         assert m._self_healthy is False
         # The user check stops running at the threshold; pushes continue.
         assert len(evals) == REPLICA_HEALTH_CHECK_UNHEALTHY_THRESHOLD
+
+    @pytest.mark.asyncio
+    async def test_heartbeats_when_metric_pushes_too_infrequent(self):
+        from types import SimpleNamespace
+
+        m = self._manager(pushing_reports=True)
+        m._autoscaling_config = SimpleNamespace(metrics_interval_s=30.0)
+        m._self_health_period_s = 10.0  # health evaluated 3x per metric push
+
+        async def ok():
+            return None
+
+        m._eval_self_health_fn = ok
+        await m._eval_and_push_self_health()
+        m._controller_handle.record_replica_health.remote.assert_called_once()
+
+    def test_self_check_runs_at_half_the_period(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from ray.serve._private.replica import Replica
+
+        r = Replica.__new__(Replica)
+        r._metrics_manager = Mock()
+        r._deployment_config = SimpleNamespace(
+            health_check_period_s=10.0, health_check_timeout_s=30.0
+        )
+        r._self_health_active = False
+        Replica._start_self_health_pusher(r)
+        args = r._metrics_manager.start_self_health_pusher.call_args.args
+        assert args[1] == 5.0  # half the period
+        assert args[2] == 30.0
+
+    def test_registry_tracks_self_check_intervals(self):
+        from ray.serve._private.deployment_state import ReplicaHealthPushRegistry
+
+        r = ReplicaHealthPushRegistry()
+        t0 = 1000.0
+        for i in range(10):
+            r.record("r1", t0 + i * 5.0, True)
+        stats = r.gap_stats()
+        assert stats["count"] == 9
+        assert 4.75 <= stats["p99_s"] <= 5.25
+        assert stats["max_s"] == 5.0
+
+    @pytest.mark.asyncio
+    async def test_no_heartbeat_when_health_rides_responses(self, monkeypatch):
+        import time as time_mod
+        from types import SimpleNamespace
+
+        import ray.serve._private.replica as replica_mod
+
+        monkeypatch.setattr(
+            replica_mod, "RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE", True
+        )
+        m = self._manager()
+        m._autoscaling_config = SimpleNamespace(metrics_interval_s=10.0)
+        m._last_health_carried_ts = time_mod.time()  # responses carried it
+
+        async def ok():
+            return None
+
+        m._eval_self_health_fn = ok
+        await m._eval_and_push_self_health()
+        m._controller_handle.record_replica_health.remote.assert_not_called()
+
+        # Traffic stopped long ago -> heartbeat resumes.
+        m._last_health_carried_ts = time_mod.time() - 60.0
+        await m._eval_and_push_self_health()
+        m._controller_handle.record_replica_health.remote.assert_called_once()
+
+    def test_router_keeps_newest_response_carried_health(self):
+        from ray.serve._private.router import RouterMetricsManager
+
+        rm = RouterMetricsManager.__new__(RouterMetricsManager)
+        rm._replica_health = {}
+        rm.record_replica_health("r1", 200.0, True, 0)
+        rm.record_replica_health("r1", 100.0, False, 2)  # delayed older
+        assert rm._replica_health["r1"] == (200.0, True, 0)
+        rm.record_replica_health("r1", 300.0, False, 1)
+        assert rm._replica_health["r1"] == (300.0, False, 1)
 
     @pytest.mark.asyncio
     async def test_in_flight_heartbeat_skips_next(self, monkeypatch):

@@ -401,8 +401,10 @@ class ReplicaMetricsManager:
         self._self_health_checked_at: Optional[float] = None
         self._eval_self_health_fn: Optional[Callable] = None
         self._self_health_timeout_s: float = 0.0
+        self._self_health_period_s: float = 0.0
         self._pushing_metric_reports = False
         self._self_consecutive_failures = 0
+        self._last_health_carried_ts: Optional[float] = None
         self._pending_health_push_ref: Optional[ObjectRef] = None
 
         # If the interval is set to 0, eagerly sets all metrics.
@@ -681,6 +683,16 @@ class ReplicaMetricsManager:
             min(record_interval_s, self._autoscaling_config.metrics_interval_s),
         )
 
+    def self_health_snapshot(self):
+        """(healthy, checked_at, consecutive_failures) from the local self-check;
+        stamps that health is being carried on a response."""
+        self._last_health_carried_ts = time.time()
+        return (
+            self._self_healthy,
+            self._self_health_checked_at,
+            self._self_consecutive_failures,
+        )
+
     def start_self_health_pusher(
         self, eval_fn: Callable, period_s: float, timeout_s: float
     ):
@@ -691,6 +703,7 @@ class ReplicaMetricsManager:
         """
         self._eval_self_health_fn = eval_fn
         self._self_health_timeout_s = timeout_s
+        self._self_health_period_s = period_s
         self._metrics_pusher.start()
         self._metrics_pusher.register_or_update_task(
             self.PUSH_SELF_HEALTH_TASK_NAME,
@@ -718,8 +731,25 @@ class ReplicaMetricsManager:
         self._self_healthy = healthy
         self._self_health_checked_at = time.time()
 
-        if self._pushing_metric_reports:
-            # Health rides on the metric report pushes.
+        if (
+            self._pushing_metric_reports
+            and self._autoscaling_config is not None
+            and self._autoscaling_config.metrics_interval_s
+            <= self._self_health_period_s
+        ):
+            # Metric-report pushes carry health at least as often as it is
+            # evaluated; a separate heartbeat would be redundant. When the
+            # metric cadence is slower than the health period, heartbeat
+            # anyway so freshness at the controller never lapses.
+            return
+        if (
+            self._autoscaling_config is not None
+            and RAY_SERVE_COLLECT_AUTOSCALING_METRICS_ON_HANDLE
+            and self._last_health_carried_ts is not None
+            and time.time() - self._last_health_carried_ts < self._self_health_period_s
+        ):
+            # Health rode recent responses and the handles forward it on
+            # their metric reports; no separate heartbeat needed.
             return
         with self._metrics_push_lock:
             if self._pending_health_push_ref is not None:
@@ -1773,6 +1803,17 @@ class Replica:
             raise e
         raise wrapped_exception from e
 
+    def _health_kwargs(self) -> Dict[str, Any]:
+        """Self-health fields piggybacked on the response queue-length info."""
+        healthy, checked_at, failures = self._metrics_manager.self_health_snapshot()
+        if checked_at is None:
+            return {}
+        return {
+            "healthy": healthy,
+            "health_checked_at": checked_at,
+            "health_consecutive_failures": failures,
+        }
+
     async def handle_request_with_rejection(
         self, request_metadata: RequestMetadata, *request_args, **request_kwargs
     ):
@@ -1784,7 +1825,9 @@ class Replica:
                 f"{request_metadata.request_id}.",
                 extra={"log_to_stderr": False},
             )
-            yield ReplicaQueueLengthInfo(False, self.get_num_ongoing_requests())
+            yield ReplicaQueueLengthInfo(
+                False, self.get_num_ongoing_requests(), **self._health_kwargs()
+            )
             return
 
         # Check if the replica has capacity for the request.
@@ -1795,7 +1838,9 @@ class Replica:
                 f"rejecting request {request_metadata.request_id}.",
                 extra={"log_to_stderr": False},
             )
-            yield ReplicaQueueLengthInfo(False, self.get_num_ongoing_requests())
+            yield ReplicaQueueLengthInfo(
+                False, self.get_num_ongoing_requests(), **self._health_kwargs()
+            )
             return
 
         request_args, request_kwargs, ray_trace_ctx = self._unpack_proxy_args(
@@ -1810,6 +1855,7 @@ class Replica:
                     # NOTE(edoakes): `_wrap_request` will increment the number
                     # of ongoing requests to include this one, so re-fetch the value.
                     num_ongoing_requests=self.get_num_ongoing_requests(),
+                    **self._health_kwargs(),
                 )
 
                 try:
@@ -2224,11 +2270,12 @@ class Replica:
         )
 
     def _start_self_health_pusher(self):
-        """Push local health on the deployment's health-check cadence."""
+        """Evaluate at half the health-check period so every replica is checked
+        well within the configured period despite scheduling jitter."""
         self._self_health_active = True
         self._metrics_manager.start_self_health_pusher(
             self._run_user_health_check,
-            self._deployment_config.health_check_period_s,
+            self._deployment_config.health_check_period_s * 0.5,
             self._deployment_config.health_check_timeout_s,
         )
 

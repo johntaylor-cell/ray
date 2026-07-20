@@ -1661,6 +1661,19 @@ class ControllerHealthMetrics(BaseModel):
     health_gap_p90_s: float = Field(default=0.0, description="p90 health-check gap.")
     health_gap_p99_s: float = Field(default=0.0, description="p99 health-check gap: deadline 99%% of checks meet.")
     health_gap_p99_9_s: float = Field(default=0.0, description="p99.9 health-check gap.")
+    # Replica self-check intervals observed via health pushes.
+    push_checks_recorded: int = Field(
+        default=0, description="Replica self-check intervals observed via pushes."
+    )
+    push_check_gap_p50_s: float = Field(
+        default=0.0, description="Median replica self-check interval."
+    )
+    push_check_gap_p99_s: float = Field(
+        default=0.0, description="p99 replica self-check interval."
+    )
+    push_check_gap_max_s: float = Field(
+        default=0.0, description="Max replica self-check interval."
+    )
     last_control_loop_time: float = Field(
         default=0.0,
         description="Time of the last control loop execution (epoch seconds).",
