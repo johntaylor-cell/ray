@@ -137,18 +137,25 @@ def _profile_controller_when_starved(sampled_flag):
         print(f"SCALE16K_PYSPY controller_pid={pid}", flush=True)
         if pid is None:
             return
-        for i in range(4):
-            try:
-                out = subprocess.run(
-                    ["sudo", "-E", "env", "PATH=" + os.environ.get("PATH", ""),
-                     "py-spy", "dump", "--pid", str(pid)],
-                    capture_output=True, text=True, timeout=30,
-                )
-                print(f"SCALE16K_PYSPY dump {i}:", flush=True)
-                print(out.stdout[-4000:] or out.stderr[-1500:], flush=True)
-            except Exception as e:
-                print(f"SCALE16K_PYSPY error={e!r}", flush=True)
-            time.sleep(3)
+        try:
+            subprocess.run(
+                ["sudo", "-E", "env", "PATH=" + os.environ.get("PATH", ""),
+                 "py-spy", "record", "--pid", str(pid), "-d", "20", "-r", "200",
+                 "-f", "raw", "-o", "/tmp/controller.folded"],
+                capture_output=True, text=True, timeout=60,
+            )
+            lines = open("/tmp/controller.folded").read().splitlines()
+            def weight(line):
+                try:
+                    return int(line.rsplit(" ", 1)[1])
+                except Exception:
+                    return 0
+            lines.sort(key=weight, reverse=True)
+            print("SCALE16K_PYSPY folded top stacks:", flush=True)
+            for line in lines[:25]:
+                print("SCALE16K_PYSPY " + line[-400:], flush=True)
+        except Exception as e:
+            print(f"SCALE16K_PYSPY error={e!r}", flush=True)
 
     threading.Thread(target=_run, daemon=True).start()
 
