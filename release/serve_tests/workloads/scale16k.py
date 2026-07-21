@@ -73,6 +73,16 @@ async def _pinned_checkpoint(handle, signal_actor, checkpoint, target_replicas, 
         )
     except RuntimeError as _e:
         print("SCALE16K_WAITER_PARTIAL " + repr(str(_e)), flush=True)
+    # Cancel requests the router never managed to place: their retry churn
+    # (queue-len probes + native call buffers) grows the driver by ~GB/min at
+    # 16K and OOM-kills it. The placed majority keeps the fleet loaded.
+    unplaced = [
+        r for r in pending_requests if not r._replica_result_future.done()
+    ]
+    for r in unplaced:
+        r.cancel()
+    if unplaced:
+        print(f"SCALE16K_PHASE cancelled_unplaced n={len(unplaced)}", flush=True)
     print("SCALE16K_PHASE sampling_start", flush=True)
     samples = []
     num_samples = marin_s // sample_s
