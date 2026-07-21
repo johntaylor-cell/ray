@@ -101,7 +101,63 @@ async def _pinned_checkpoint(handle, signal_actor, checkpoint, target_replicas, 
     return samples
 
 
+def _start_driver_memory_monitor():
+    """Diagnose driver OOM: log the cgroup limit once, then RSS + top Python
+    allocators every 30s as SCALE16K_DRIVERMEM lines (readable post-mortem)."""
+    import gc
+    import threading
+    import tracemalloc
+
+    tracemalloc.start(1)
+
+    def _cgroup_limit():
+        for path in (
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ):
+            try:
+                return open(path).read().strip()
+            except Exception:
+                continue
+        return "unknown"
+
+    def _rss_mb():
+        try:
+            for line in open("/proc/self/status"):
+                if line.startswith("VmRSS"):
+                    return int(line.split()[1]) // 1024
+        except Exception:
+            pass
+        return -1
+
+    print(f"SCALE16K_DRIVERMEM_LIMIT {_cgroup_limit()}", flush=True)
+
+    def _loop():
+        while True:
+            try:
+                snap = tracemalloc.take_snapshot()
+                stats = snap.statistics("lineno")
+                traced_mb = sum(st.size for st in stats) // (1024 * 1024)
+                tops = "|".join(
+                    f"{st.traceback[0].filename.split(chr(47))[-1]}:"
+                    f"{st.traceback[0].lineno}={st.size // (1024 * 1024)}MB"
+                    for st in stats[:8]
+                )
+                print(
+                    f"SCALE16K_DRIVERMEM rss_mb={_rss_mb()} "
+                    f"traced_mb={traced_mb} gc_counts={gc.get_count()} "
+                    f"top={tops}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"SCALE16K_DRIVERMEM error={e!r}", flush=True)
+            time.sleep(30)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 async def main():
+    _start_driver_memory_monitor()
     if not ray.is_initialized():
         ray.init()
     signal = cmn._SignalActorForController.remote()
