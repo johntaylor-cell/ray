@@ -2353,6 +2353,11 @@ class DeploymentReplica:
         return self._actor.get_outbound_deployments()
 
 
+# Per-opt benchmark toggles (default on). Set to 0 to isolate an opt.
+_ENABLE_RANK_GATE = os.environ.get("RAY_SERVE_ENABLE_RANK_GATE", "1") != "0"
+_ENABLE_IDWALK_CACHE = os.environ.get("RAY_SERVE_ENABLE_IDWALK_CACHE", "1") != "0"
+
+
 def _memoized_walk(obj, memo_attr: str, token, compute):
     """Return compute() memoized on *token* in obj.<memo_attr>.
 
@@ -2360,7 +2365,12 @@ def _memoized_walk(obj, memo_attr: str, token, compute):
     Callers must treat returned collections as immutable (they are shared).
     """
     memo = getattr(obj, memo_attr)
-    if token is not None and memo is not None and memo[0] == token:
+    if (
+        _ENABLE_IDWALK_CACHE
+        and token is not None
+        and memo is not None
+        and memo[0] == token
+    ):
         return memo[1]
     result = compute()
     setattr(obj, memo_attr, None if token is None else (token, result))
@@ -5235,7 +5245,7 @@ class DeploymentState:
         ):
             return
         version = self._replicas.mutation_version
-        if version == self._last_rank_membership_version:
+        if _ENABLE_RANK_GATE and version == self._last_rank_membership_version:
             return
         active_replicas = self._replicas.get()
         if not active_replicas:

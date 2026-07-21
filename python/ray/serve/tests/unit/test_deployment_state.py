@@ -10100,23 +10100,33 @@ class TestMutationVersionMemo:
         assert a == b and a is not b
         assert ds._alive_replica_actor_ids_memo is None
 
-    def test_autoscaling_update_skips_same_list_object(self):
+    def test_autoscaling_update_skips_unchanged_membership(self):
+        # A8 gates the rebuild + metrics-version bump on value-equality of the
+        # running set, so an unchanged set (any object) skips and keeps the
+        # merge cache valid; a changed set rebuilds and bumps the version.
         from ray.serve._private import autoscaling_state as as_mod
 
         das = as_mod.DeploymentAutoscalingState.__new__(
             as_mod.DeploymentAutoscalingState
         )
         das._running_replicas = []
+        das._replica_metrics = {}
+        das._metrics_version = 0
         rid = Mock()
         rid.to_full_id_str.return_value = "d#r1"
         ids = [rid]
         das.update_running_replica_ids(ids)
         assert das._cached_running_replica_strs == {"d#r1"}
+        v = das._metrics_version
         das._cached_running_replica_strs = {"sentinel"}
-        das.update_running_replica_ids(ids)  # same object -> skipped
+        das.update_running_replica_ids(list(ids))  # equal value -> skipped
         assert das._cached_running_replica_strs == {"sentinel"}
-        das.update_running_replica_ids(list(ids))  # new object -> rebuilt
-        assert das._cached_running_replica_strs == {"d#r1"}
+        assert das._metrics_version == v  # cache stays valid
+        rid2 = Mock()
+        rid2.to_full_id_str.return_value = "d#r2"
+        das.update_running_replica_ids([rid2])  # changed -> rebuilt + bumped
+        assert das._cached_running_replica_strs == {"d#r2"}
+        assert das._metrics_version == v + 1
 
 
 if __name__ == "__main__":
