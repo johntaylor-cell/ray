@@ -140,7 +140,8 @@ def _profile_controller_when_starved(sampled_flag):
         for i in range(4):
             try:
                 out = subprocess.run(
-                    ["py-spy", "dump", "--pid", str(pid)],
+                    ["sudo", "-E", "env", "PATH=" + os.environ.get("PATH", ""),
+                     "py-spy", "dump", "--pid", str(pid)],
                     capture_output=True, text=True, timeout=30,
                 )
                 print(f"SCALE16K_PYSPY dump {i}:", flush=True)
