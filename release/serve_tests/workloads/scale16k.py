@@ -85,6 +85,7 @@ async def _pinned_checkpoint(handle, signal_actor, checkpoint, target_replicas, 
         print(f"SCALE16K_PHASE cancelled_unplaced n={len(unplaced)}", flush=True)
     print("SCALE16K_PHASE sampling_start", flush=True)
     samples = []
+    _profile_controller_when_starved(samples)
     num_samples = marin_s // sample_s
     for sample_idx in range(num_samples):
         health_metrics = await cmn._controller_get_health_metrics()
@@ -109,6 +110,46 @@ async def _pinned_checkpoint(handle, signal_actor, checkpoint, target_replicas, 
     except asyncio.TimeoutError:
         pass
     return samples
+
+
+def _profile_controller_when_starved(sampled_flag):
+    """If sampling produces nothing for 45s, py-spy the controller (same node)
+    and print its stacks as SCALE16K_PYSPY lines -- names the ingest hog."""
+    import glob
+    import subprocess
+    import threading
+
+    def _controller_pid():
+        for cmdline in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                args = open(cmdline, "rb").read().decode(errors="ignore")
+            except Exception:
+                continue
+            if "ServeController" in args:
+                return cmdline.split("/")[2]
+        return None
+
+    def _run():
+        time.sleep(45)
+        if sampled_flag:
+            return
+        pid = _controller_pid()
+        print(f"SCALE16K_PYSPY controller_pid={pid}", flush=True)
+        if pid is None:
+            return
+        for i in range(4):
+            try:
+                out = subprocess.run(
+                    ["py-spy", "dump", "--pid", str(pid)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                print(f"SCALE16K_PYSPY dump {i}:", flush=True)
+                print(out.stdout[-4000:] or out.stderr[-1500:], flush=True)
+            except Exception as e:
+                print(f"SCALE16K_PYSPY error={e!r}", flush=True)
+            time.sleep(3)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _start_driver_memory_monitor():
