@@ -350,6 +350,10 @@ def _load_deployment_def_from_import_path(import_path: str) -> Callable:
 
 
 _ENABLE_PUSH_HEALTH = os.environ.get("RAY_SERVE_ENABLE_PUSH_HEALTH", "1") != "0"
+# Push sub-tiers (require P1): P2 = self-health carried on handle reports;
+# P3 = health frames on open response streams.
+_ENABLE_HANDLE_HEALTH = os.environ.get("RAY_SERVE_ENABLE_HANDLE_HEALTH", "1") != "0"
+_ENABLE_HEALTH_FRAMES = os.environ.get("RAY_SERVE_ENABLE_HEALTH_FRAMES", "1") != "0"
 
 
 class ReplicaMetricsManager:
@@ -1869,6 +1873,8 @@ class Replica:
 
     def _health_kwargs(self) -> Dict[str, Any]:
         """Self-health fields piggybacked on the response queue-length info."""
+        if not (_ENABLE_PUSH_HEALTH and _ENABLE_HANDLE_HEALTH):
+            return {}
         healthy, checked_at, failures = self._metrics_manager.self_health_snapshot()
         if checked_at is None:
             return {}
@@ -1918,6 +1924,7 @@ class Replica:
                 # frame pump only when frames are declared.
                 sends_frames = (
                     _ENABLE_PUSH_HEALTH
+                    and _ENABLE_HEALTH_FRAMES
                     and request_metadata.supports_health_frames
                     and not self._metrics_manager.health_already_carried()
                 )
@@ -2393,10 +2400,11 @@ class Replica:
             self._deployment_config.health_check_period_s * 0.5,
             self._deployment_config.health_check_timeout_s,
         )
-        # Routers in this process fold our health into their handle reports.
-        ray.serve.context._set_self_health_report_provider(
-            self._metrics_manager.self_health_report_entry
-        )
+        # Routers in this process fold our health into their handle reports (P2).
+        if _ENABLE_HANDLE_HEALTH:
+            ray.serve.context._set_self_health_report_provider(
+                self._metrics_manager.self_health_report_entry
+            )
 
     async def _run_user_health_check(self):
         try:
