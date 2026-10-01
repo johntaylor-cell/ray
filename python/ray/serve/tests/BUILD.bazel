@@ -905,6 +905,42 @@ py_test_module_list(
     ],
 )
 
+# Forwarding must behave the same whichever loop the router and user code run on.
+py_test_module_list(
+    size = "large",
+    env = {"RAY_SERVE_THROUGHPUT_OPTIMIZED": "1"},
+    files = [
+        "test_response_forwarding.py",
+    ],
+    tags = [
+        "exclusive",
+        "team:serve",
+    ],
+    deps = [
+        ":common",
+        ":conftest",
+        "//python/ray/serve:serve_lib",
+    ],
+)
+
+py_test_module_list(
+    size = "large",
+    env = {"RAY_SERVE_ENABLE_DIRECT_INGRESS": "1"},
+    files = [
+        "test_response_forwarding.py",
+    ],
+    name_suffix = "_default_mode",
+    tags = [
+        "exclusive",
+        "team:serve",
+    ],
+    deps = [
+        ":common",
+        ":conftest",
+        "//python/ray/serve:serve_lib",
+    ],
+)
+
 py_test_module_list(
     size = "large",
     timeout = "eternal",
