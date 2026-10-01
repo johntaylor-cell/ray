@@ -120,6 +120,12 @@ from ray.serve._private.default_impl import (
 from ray.serve._private.direct_ingress_grpc_util import gRPCDIReceiveStream
 from ray.serve._private.direct_ingress_http_util import ASGIDIReceiveProxy
 from ray.serve._private.event_loop_monitoring import EventLoopMonitor
+from ray.serve._private.forward import (
+    FORWARD_ROUTE,
+    PendingForward,
+    is_forwardable,
+    serve_forwarded_call,
+)
 from ray.serve._private.grpc_util import (
     get_grpc_response_status,
     set_grpc_code_and_details,
@@ -2318,9 +2324,7 @@ class Replica:
         if not RAY_SERVE_ENABLE_DIRECT_INGRESS:
             return
 
-        if not self._ingress and not self._is_ingress_request_router:
-            return
-
+        # Non-ingress replicas start an HTTP server too, so parents can forward to them.
         async def allocate_and_start_server(start_server_fn, protocol):
             """Attempt to allocate a port and start the server with retries."""
             is_port_in_use = False
@@ -3175,6 +3179,15 @@ class Replica:
             )
             return
 
+        if route == FORWARD_ROUTE:
+            await serve_forwarded_call(self, scope, receive, send)
+            return
+
+        if not self._ingress and not self._is_ingress_request_router:
+            # These replicas serve HTTP only for forwarded calls.
+            await send_http_response(f"Path '{route}' not found.", 404, send)
+            return
+
         # If the HTTP path does not match the deployment route prefix,
         # it is invalid and we should not serve it. Ingress request router
         # peer deployments (e.g. LLMRouter) have no route prefix; fall
@@ -3292,6 +3305,7 @@ class Replica:
                     response_finished = True
 
             async def call_asgi():
+                pending = None
                 async with self._start_request(request_metadata):
                     # Acquired an ongoing-request slot, so it's running, not queued.
                     release_queue_slot()
@@ -3306,15 +3320,39 @@ class Replica:
                         # `_call_http_entrypoint` will have already called
                         # `send_user_message`, so the ASGI messages will have
                         # already been sent back to the client.
-                        await self._user_callable_wrapper._call_http_entrypoint(
-                            user_method_info, scope, receive_proxy, send_user_message
+                        result = (
+                            await self._user_callable_wrapper._call_http_entrypoint(
+                                user_method_info,
+                                scope,
+                                receive_proxy,
+                                send_user_message,
+                                defer_forward=True,
+                            )
                         )
+                        if isinstance(result, PendingForward):
+                            pending = result
                     else:
                         async for asgi_messages in self._user_callable_wrapper.call_http_entrypoint(
-                            request_metadata, status_code_callback, scope, receive_proxy
+                            request_metadata,
+                            status_code_callback,
+                            scope,
+                            receive_proxy,
+                            defer_forward=True,
                         ):
+                            if isinstance(asgi_messages, PendingForward):
+                                pending = asgi_messages
+                                continue
                             for message in asgi_messages:
                                 await send_user_message(message)
+                if pending is not None:
+                    # Like a routing call, a forward holds the slot only while the handler runs.
+                    try:
+                        await pending.deliver(scope, receive_proxy, send_user_message)
+                    except Exception as e:
+                        if not response_started:
+                            response = self._user_callable_wrapper.handle_exception(e)
+                            await response(scope, receive_proxy, send_user_message)
+                        raise
 
             # Optimization: if Serve doesn't need to handle disconnects and
             # timeouts for this request, we can avoid event loop overhead by
@@ -4256,6 +4294,7 @@ class UserCallableWrapper:
         sync_gen_consumed: bool,
         generator_result_callback: Callable,
         asgi_args: ASGIArgs,
+        defer_forward: bool = False,
     ) -> Any:
         """Postprocess the result of a user method.
 
@@ -4281,7 +4320,14 @@ class UserCallableWrapper:
             elif is_http_request and not user_method_info.is_asgi_app:
                 # For the FastAPI codepath, the response has already been sent over
                 # ASGI, but for the vanilla deployment codepath we need to send it.
-                await self._send_user_result_over_asgi(result, asgi_args)
+                if is_forwardable(result):
+                    # Claimed now, before this loop turns and routes the call.
+                    pending = PendingForward(result)
+                    if defer_forward:
+                        return pending
+                    await pending.deliver(*asgi_args.to_args_tuple())
+                else:
+                    await self._send_user_result_over_asgi(result, asgi_args)
             elif not is_http_request and not sync_gen_consumed:
                 # If a unary method is called with stream=True for anything EXCEPT
                 # an HTTP request, raise an error.
@@ -4313,6 +4359,7 @@ class UserCallableWrapper:
         status_code_callback: StatusCodeCallback,
         scope: Scope,
         receive: Receive,
+        defer_forward: bool = False,
     ) -> Any:
         result_queue = MessageQueue()
         user_method_info = self.get_user_method_info(request_metadata.call_method)
@@ -4326,7 +4373,7 @@ class UserCallableWrapper:
                 system_event_loop.call_soon_threadsafe(result_queue.put_nowait, item)
 
             call_future = self._call_http_entrypoint(
-                user_method_info, scope, receive, enqueue
+                user_method_info, scope, receive, enqueue, defer_forward=defer_forward
             )
         else:
 
@@ -4334,7 +4381,13 @@ class UserCallableWrapper:
                 result_queue.put_nowait(item)
 
             call_future = asyncio.create_task(
-                self._call_http_entrypoint(user_method_info, scope, receive, enqueue)
+                self._call_http_entrypoint(
+                    user_method_info,
+                    scope,
+                    receive,
+                    enqueue,
+                    defer_forward=defer_forward,
+                )
             )
 
         first_message_peeked = False
@@ -4354,6 +4407,10 @@ class UserCallableWrapper:
 
             yield messages
 
+        if defer_forward and isinstance(call_future.result(), PendingForward):
+            # Delivered by the caller once the request's slot is released.
+            yield call_future.result()
+
     @_run_user_code
     async def _call_http_entrypoint(
         self,
@@ -4361,10 +4418,12 @@ class UserCallableWrapper:
         scope: Scope,
         receive: Receive,
         send: Send,
+        defer_forward: bool = False,
     ) -> Any:
         """Call an HTTP entrypoint.
 
-        `send` is used to communicate the results of streaming responses.
+        `send` is used to communicate the results of streaming responses. With
+        `defer_forward`, a forwarded child response is returned for the caller to deliver.
 
         Raises any exception raised by the user code so it can be propagated as a
         `RayTaskError`.
@@ -4414,6 +4473,7 @@ class UserCallableWrapper:
                 sync_gen_consumed=sync_gen_consumed,
                 generator_result_callback=send,
                 asgi_args=ASGIArgs(scope, receive, send),
+                defer_forward=defer_forward,
             )
 
             if receive_task is not None and not receive_task.done():

@@ -5586,8 +5586,12 @@ class DeploymentState:
                 # This replica is permanently leaving the container. Record
                 # the removal so the ingress port version advances and the
                 # direct-ingress port reconcile/prune runs to reclaim its port
-                # (the running-replica-set comparison won't flag this).
-                if self.owns_direct_ingress_ports():
+                # (the running-replica-set comparison won't flag this). Forward
+                # targets hold an HTTP port too.
+                if (
+                    self.owns_direct_ingress_ports()
+                    or replica.actor_http_port is not None
+                ):
                     self._ingress_membership_removed = True
 
                 # Retain replicas that allocated a log file so the dashboard can
