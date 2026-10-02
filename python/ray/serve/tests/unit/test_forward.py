@@ -3,12 +3,15 @@ import sys
 
 import pytest
 
+import ray.serve.context
+from ray.serve._private.common import RequestMetadata
 from ray.serve._private.forward import (
     FORWARD_ROUTE,
     HIGH_WATER,
     REFUSED_CAPACITY,
     REFUSED_HEADER,
     TERMINATOR,
+    _answer,
     _ChunkDecoder,
     _find_transport,
     _held_back,
@@ -298,6 +301,29 @@ def test_release_pools_only_completed_connections():
         assert cut.transport.closing
 
     asyncio.run(run())
+
+
+def test_a_forwarded_handler_can_forward_again():
+    seen = []
+
+    class Wrapper:
+        async def call_user_method(self, request_metadata, args, kwargs):
+            seen.append(ray.serve.context._get_serve_request_context()._forwardable)
+            return "ok"
+
+    async def run():
+        messages = []
+
+        async def send(message):
+            messages.append(message)
+
+        meta = RequestMetadata(request_id="r", internal_request_id="i")
+        await _answer(Wrapper(), meta, (), {}, {}, None, send, lambda code: None)
+        return messages
+
+    messages = asyncio.run(run())
+    assert seen == [True]
+    assert messages[-1]["type"] == "http.response.body"
 
 
 if __name__ == "__main__":

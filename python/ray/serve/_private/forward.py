@@ -552,6 +552,8 @@ async def _answer(
                 first = None
             await _send_stream(first, results, send, callback)
             return
+        # Like a plain HTTP handler, a forwarded call can forward a call it returns.
+        ray.serve.context._mark_request_forwardable()
         result = await wrapper.call_user_method(request_metadata, args, kwargs)
     except Exception as e:
         response = wrapper.handle_exception(e)
