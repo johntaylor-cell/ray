@@ -8,7 +8,7 @@ import contextvars
 import logging
 import os
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional
 
 import ray
@@ -392,6 +392,11 @@ def _set_request_context(
             or current_request_context.multiplexed_model_id,
         )
     )
+
+
+def _mark_request_forwardable():
+    """Let a call the running handler returns unawaited be forwarded."""
+    _serve_request_context.set(replace(_get_serve_request_context(), _forwardable=True))
 
 
 def _unset_request_context():
