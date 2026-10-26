@@ -4321,7 +4321,7 @@ class UserCallableWrapper:
                 # For the FastAPI codepath, the response has already been sent over
                 # ASGI, but for the vanilla deployment codepath we need to send it.
                 if is_forwardable(result):
-                    # Claimed now, before this loop turns and routes the call.
+                    # Claim at once to beat the router; a lost race is relayed.
                     pending = PendingForward(result)
                     if defer_forward:
                         return pending

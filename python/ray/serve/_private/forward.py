@@ -409,7 +409,7 @@ async def _relay_chunks(up: _Upstream, send) -> None:
 class PendingForward:
     """A child response a handler returned unawaited, delivered as the handler's response.
 
-    The call is claimed at once, before the handler's loop can turn and route it.
+    The call is claimed at once to beat its router; a lost race is relayed.
     """
 
     def __init__(self, response):
